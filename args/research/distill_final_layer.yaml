@@ -1,0 +1,3 @@
+base: distill_3b_to_looped_1b.yaml
+name: gsm-distill-final-layer-seed0
+codi_alignment: final

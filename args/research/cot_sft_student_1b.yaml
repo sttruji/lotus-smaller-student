@@ -1,0 +1,5 @@
+base:
+  - ../base/cot.yaml
+  - common.yaml
+name: gsm-cot-sft-student-1b-seed0
+model_id: meta-llama/Llama-3.2-1B-Instruct

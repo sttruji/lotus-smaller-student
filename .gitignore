@@ -1,4 +1,6 @@
 __pycache__/
+.pytest_cache/
+.venv/
 *.py[cod]
 *.so
 
@@ -28,5 +30,4 @@ dist/
 condaenv.*.requirements.txt
 
 data/
-
 

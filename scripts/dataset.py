@@ -323,6 +323,12 @@ def get_cot_latent_dataset(
 
         n_latent_tokens *= configs.c_thought
 
+        # At the final research stage the student sees no explicit rationale.
+        # This is independent of the number of recurrence passes; intermediate
+        # per-step LOTUS supervision must be disabled when these counts differ.
+        if getattr(configs, "replace_all_cot_at_max_stage", False) and scheduled_stage_to_train >= configs.max_latent_stage:
+            n_skip_steps = len(sample["steps_tokenized"])
+
         if single_latent_token:
             n_latent_tokens = 1
         elif hasattr(configs, 'fixed_latent_tokens') and configs.fixed_latent_tokens > 0:

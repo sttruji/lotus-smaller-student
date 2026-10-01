@@ -1,5 +1,19 @@
 # Bridging the Gap Between Latent and Explicit Reasoning with Looped Transformers
 
+## Smaller-student research branch
+
+This branch adds frozen **3B explicit teacher → recurrent 1B student** distillation,
+cross-size layer/width alignment, explicit CoT-SFT baselines, compute-node launch
+configs and student-only export. See [RESEARCH_SCAFFOLD.md](RESEARCH_SCAFFOLD.md)
+for the design, tested paths, setup and training commands.
+
+```bash
+python scripts/smoke_distillation.py --steps 3  # CPU, no model downloads
+NPROC_PER_NODE=1 bash launch_distillation.sh  # Allocated CUDA node, prepared data/environment
+```
+
+The upstream paper implementation and configuration files are retained below.
+
 This project is for the paper: [Bridging the Gap Between Latent and Explicit Reasoning with Looped Transformers](https://arxiv.org/abs/2606.31779).
 
 <!-- Project Page URL assumes GitHub Pages is enabled (Settings -> Pages -> deploy from branch: main, folder: /docs) on the public yingfan-bot/lotus repo. -->

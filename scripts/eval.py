@@ -103,6 +103,8 @@ def main():
                         help="Evaluate a CoT model (plain causal LM, no latent tokens)")
     parser.add_argument("--save_preds", default=None,
                         help="Optional path to dump per-example predictions (JSON).")
+    parser.add_argument("--save_metrics", default=None,
+                        help="Save accuracy, complete inference phase times, peak memory and model metadata (JSON).")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -136,6 +138,8 @@ def main():
                 ckpt_path = model_file
         print(f"Loading checkpoint from {ckpt_path}...")
         saved_weights = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        # Projection heads are only used during teacher distillation.
+        saved_weights = {k: v for k, v in saved_weights.items() if not k.startswith("distill_alignment.")}
 
         # Check vocab size and resize if needed
         emb_key = None
@@ -409,6 +413,20 @@ def main():
         with open(args.save_preds, "w") as f:
             json.dump(dump, f)
         print(f"Saved per-example predictions to {args.save_preds}")
+
+    if args.save_metrics:
+        import transformers
+        metadata = {"model_id": args.model_id, "checkpoint": args.checkpoint,
+                    "cot": args.cot, "n_looped_iters": args.n_looped_iters,
+                    "c_thought": args.c_thought, "max_new_tokens": args.max_new_tokens,
+                    "dtype": str(dtype), "unique_parameters": sum(p.numel() for p in model.parameters()),
+                    "gpu": torch.cuda.get_device_name(device),
+                    "torch_version": torch.__version__, "transformers_version": transformers.__version__,
+                    "batch_size": 1,
+                    "timing_scope": "query prefill + all reasoning + answer delimiter + answer decoding; no warmup exclusion"}
+        with open(args.save_metrics, "w") as f:
+            json.dump({"metadata": metadata, "datasets": results}, f, indent=2)
+        print(f"Saved accuracy/resource metrics to {args.save_metrics}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,6 @@
+base: distill_3b_to_looped_1b.yaml
+name: gsm-looped-1b-no-kd-seed0
+codi_loss_weight: 0.0
+teacher_model_path: null
+require_smaller_student: false
+# Retain the same auxiliary student CoT objective to isolate the KD term.

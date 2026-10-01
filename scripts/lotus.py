@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 from transformers.models.gpt2 import GPT2LMHeadModel
+from distillation import BoundaryAlignment, cross_size_losses, reconstruct_explicit_batch
 
 Outputs = namedtuple("Outputs", [
     "loss", "inputs_embeds", "logits", "intermediate_logits",
@@ -17,6 +18,7 @@ Outputs = namedtuple("Outputs", [
     "inter_loss_sum", "n_inter_valid",
     "codi_loss", "codi_loss_sum", "n_codi_valid",
     "inter_answer_loss", "inter_answer_loss_sum", "n_inter_answer_valid",
+    "student_cot_loss", "student_cot_loss_sum", "n_student_cot_valid",
 ])
 
 
@@ -161,6 +163,11 @@ def efficient_forward(model, inputs_embeds, attention_mask, position_ids, past_k
     saving vs. output_hidden_states=True).
     """
     base_model = model
+    cache_enabled = not (base_model.training and base_model.is_gradient_checkpointing)
+    if not cache_enabled:
+        # A mutable DynamicCache must never enter a checkpointed decoder:
+        # recomputation would append keys again and change tensor shapes.
+        past_key_values = None
 
     if is_gpt2:
         # GPT2: call transformer directly
@@ -171,7 +178,7 @@ def efficient_forward(model, inputs_embeds, attention_mask, position_ids, past_k
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            use_cache=True,
+            use_cache=cache_enabled,
         )
         hidden_states = transformer_outputs.last_hidden_state
         logits = lm_head(hidden_states)
@@ -184,10 +191,10 @@ def efficient_forward(model, inputs_embeds, attention_mask, position_ids, past_k
         # converts None -> DynamicCache internally but then sets
         # return_legacy_cache=True, returning a tuple, which breaks callers that
         # pass the cache to LlamaForCausalLM (expects a Cache object).
-        if past_key_values is None:
+        if cache_enabled and past_key_values is None:
             from transformers import DynamicCache
             past_key_values = DynamicCache()
-        elif isinstance(past_key_values, tuple):
+        elif cache_enabled and isinstance(past_key_values, tuple):
             from transformers import DynamicCache
             past_key_values = DynamicCache.from_legacy_cache(past_key_values)
         model_outputs = llama_model(
@@ -195,7 +202,7 @@ def efficient_forward(model, inputs_embeds, attention_mask, position_ids, past_k
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            use_cache=True,
+            use_cache=cache_enabled,
         )
         hidden_states = model_outputs.last_hidden_state
         logits = lm_head(hidden_states)
@@ -256,6 +263,11 @@ class Lotus(nn.Module):
         flat_intermediate_supervision=False,  # If True, pack CoT tokens contiguously across all latent slots
         ia_loss_after_loop=False,  # If True, compute IA loss once after all loops using all latent hidden states
         latent_injection_mode="add",  # "add" (default, current): embed_t = original + h_{t-1}; "replace": embed_t = h_{t-1} (drops residual to test recurrent variance amplification)
+        codi_alignment="legacy",
+        distillation_epsilon=1e-6,
+        student_cot_loss_weight=0.0,
+        main_answer_only=False,
+        require_smaller_student=False,
     ):
 
         super(Lotus, self).__init__()
@@ -274,6 +286,25 @@ class Lotus(nn.Module):
         self.intermediate_label_smoothing = intermediate_label_smoothing
         self.codi_loss_weight = codi_loss_weight
         self.codi_loss_type = codi_loss_type
+        self.codi_alignment = codi_alignment
+        self.student_cot_loss_weight = student_cot_loss_weight
+        self.main_answer_only = main_answer_only
+        if codi_alignment not in ("legacy", "relative_depth", "final"):
+            raise ValueError(f"Unknown codi_alignment: {codi_alignment}")
+        self.distill_alignment = None
+        if codi_loss_weight > 0 and teacher_model is None:
+            raise ValueError("Distillation requires a teacher; no silent fallback is allowed.")
+        if codi_loss_weight > 0 and teacher_model is not None:
+            if require_smaller_student and sum(p.numel() for p in base_causallm.parameters()) >= sum(p.numel() for p in teacher_model.parameters()):
+                raise ValueError("require_smaller_student requires fewer unique student backbone parameters than teacher parameters.")
+            if codi_alignment == "legacy":
+                if (base_causallm.config.hidden_size, base_causallm.config.num_hidden_layers) != (teacher_model.config.hidden_size, teacher_model.config.num_hidden_layers):
+                    raise ValueError("Legacy alignment requires equal widths/depths; use relative_depth or final for cross-size distillation.")
+            else:
+                if codi_loss_type != "normalized_l1":
+                    raise ValueError("Cross-size alignment currently implements codi_loss_type=normalized_l1.")
+                self.distill_alignment = BoundaryAlignment(base_causallm.config, teacher_model.config,
+                                                          codi_alignment, distillation_epsilon)
         self.inter_answer_loss_weight = inter_answer_loss_weight
         self.ia_no_prefix = ia_no_prefix
         self.ia_decoder_layers = ia_decoder_layers
@@ -427,7 +458,7 @@ class Lotus(nn.Module):
 
     def forward(
         self, input_ids, attention_mask, labels, position_ids, n_looped_iters=0, 
-        replaced_cot_steps=None, sample_stages=None, **kwargs
+        replaced_cot_steps=None, sample_stages=None, answer_labels=None, **kwargs
     ):
         """
         Forward pass with full prefix looping and original input injection.
@@ -444,6 +475,13 @@ class Lotus(nn.Module):
                           each sample uses hidden states from its stage-th loop iteration.
         """
 
+        if self.main_answer_only and not getattr(self, "_in_generate", False):
+            if answer_labels is None:
+                raise ValueError("main_answer_only requires answer_labels.")
+            labels = answer_labels
+        research_kd = self.codi_alignment != "legacy" and self.codi_loss_weight > 0 and self.training
+        research_aux = self.student_cot_loss_weight > 0 and self.training
+
         # Get original embeddings (used for injection at each loop)
         original_embeddings = self.embedding(input_ids)
         inputs_embeds = original_embeddings.clone()
@@ -452,7 +490,7 @@ class Lotus(nn.Module):
         n_replaced_steps = replaced_cot_steps.shape[1] if replaced_cot_steps is not None else 0
 
         # Verify n_looped_iters >= number of replaced CoT steps (we can loop more than we have supervision for)
-        if n_replaced_steps > 0 and n_looped_iters > 0:
+        if n_replaced_steps > 0 and n_looped_iters > 0 and (self.intermediate_loss_weight > 0 or self.inter_answer_loss_weight > 0):
             assert n_looped_iters >= n_replaced_steps, (
                 f"n_looped_iters ({n_looped_iters}) must be >= number of replaced CoT steps ({n_replaced_steps})"
             )
@@ -483,6 +521,7 @@ class Lotus(nn.Module):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 use_cache=True,
+                output_hidden_states=research_kd,
             )
             # Store KV cache for generation
             self._last_kv_cache = outputs.past_key_values
@@ -500,13 +539,21 @@ class Lotus(nn.Module):
             self.gen_forward_cnt += 1
             _zero = torch.tensor(0.0, device=input_ids.device)
             _zero_int = torch.tensor(0, device=input_ids.device)
+            kd_sum, kd_count, cot_sum, cot_count = self._research_losses(
+                input_ids, attention_mask, answer_labels, replaced_cot_steps,
+                outputs.hidden_states if research_kd else None, 0, research_kd, research_aux,
+            )
+            kd_loss = kd_sum / kd_count.clamp(min=1)
+            cot_loss = cot_sum / cot_count.clamp(min=1)
             return Outputs(
-                loss=loss, inputs_embeds=inputs_embeds, logits=logits,
+                loss=loss + self.codi_loss_weight * kd_loss + self.student_cot_loss_weight * cot_loss,
+                inputs_embeds=inputs_embeds, logits=logits,
                 intermediate_logits=[], main_loss=loss, intermediate_loss=_zero,
                 main_loss_sum=loss_sum, n_main_valid=n_valid,
                 inter_loss_sum=_zero, n_inter_valid=_zero_int,
-                codi_loss=_zero, codi_loss_sum=_zero, n_codi_valid=_zero_int,
+                codi_loss=kd_loss, codi_loss_sum=kd_sum, n_codi_valid=kd_count,
                 inter_answer_loss=_zero, inter_answer_loss_sum=_zero, n_inter_answer_valid=_zero_int,
+                student_cot_loss=cot_loss, student_cot_loss_sum=cot_sum, n_student_cot_valid=cot_count,
             )
 
         # Find the earliest and latest latent token positions across the batch
@@ -707,13 +754,17 @@ class Lotus(nn.Module):
             loop_kv = _clone_kv_cache(prefix_kv_cache)
 
             # Vectorized embedding injection for latent positions only
-            inputs_embeds[:, loop_start:loop_end, :] = inject_latent_embeddings(
+            updated_region = inject_latent_embeddings(
                 inputs_embeds[:, loop_start:loop_end, :],
                 original_embeddings[:, loop_start:loop_end, :],
                 hidden_states,
                 latent_ranges,
                 offset=loop_start,  # Convert absolute to relative positions
             )
+            # Earlier forwards retain views of these inputs for backward.
+            # Updating their backing tensor in-place invalidates autograd.
+            inputs_embeds = torch.cat((inputs_embeds[:, :loop_start, :], updated_region,
+                                       inputs_embeds[:, loop_end:, :]), dim=1)
 
             # Forward through loop region with updated embeddings
             # Reuse prefix cache (positions before loop_start never change)
@@ -1150,14 +1201,9 @@ class Lotus(nn.Module):
 
             hidden_states = torch.where(frozen_mask.unsqueeze(-1), frozen_values, hidden_states)
 
-        # Inject final hidden states into embeddings for suffix processing
-        inputs_embeds[:, loop_start:loop_end, :] = inject_latent_embeddings(
-            inputs_embeds[:, loop_start:loop_end, :],
-            original_embeddings[:, loop_start:loop_end, :],
-            hidden_states,
-            latent_ranges,
-            offset=loop_start,
-        )
+        # The cached suffix attends to the LAST loop's KV. Without a cache
+        # (checkpointed training), replay that same loop input, rather than
+        # injecting one additional, inference-only-inconsistent recurrence.
 
         # After final loop iteration, save combined KV cache for processing remaining tokens.
         # With gradient checkpointing, HF silently sets use_cache=False, so
@@ -1176,7 +1222,7 @@ class Lotus(nn.Module):
 
         # Step 4: Process remaining tokens (CoT steps + answer) if they exist
         # CODI loss needs all-layer hidden states from the suffix forward
-        need_suffix_hidden = (self.codi_loss_weight > 0 and self.training
+        need_suffix_hidden = research_kd or (self.codi_loss_weight > 0 and self.training
                               and self.teacher_model is not None
                               and n_replaced_steps > 0 and replaced_cot_steps is not None)
         suffix_all_hidden_states = None
@@ -1276,7 +1322,7 @@ class Lotus(nn.Module):
         codi_loss = torch.tensor(0.0, device=input_ids.device)
         codi_loss_sum = torch.tensor(0.0, device=input_ids.device)
         n_codi_valid = torch.tensor(0, device=input_ids.device)
-        if (self.teacher_model is not None and self.codi_loss_weight > 0
+        if (self.codi_alignment == "legacy" and self.teacher_model is not None and self.codi_loss_weight > 0
             and n_replaced_steps > 0 and replaced_cot_steps is not None and self.training):
 
             codi_loss_sum, n_codi_valid = self._compute_codi_loss(
@@ -1291,6 +1337,15 @@ class Lotus(nn.Module):
             if n_codi_valid > 0:
                 codi_loss = codi_loss_sum / n_codi_valid.clamp(min=1).float()
 
+        research_kd_sum, research_kd_count, cot_sum, cot_count = self._research_losses(
+            input_ids, attention_mask, answer_labels, replaced_cot_steps,
+            suffix_all_hidden_states, loop_end, research_kd, research_aux,
+        )
+        if research_kd:
+            codi_loss_sum, n_codi_valid = research_kd_sum, research_kd_count
+            codi_loss = codi_loss_sum / n_codi_valid.clamp(min=1)
+        cot_loss = cot_sum / cot_count.clamp(min=1)
+
         # Intermediate answer supervision: compute local mean for logging
         if inter_answer_n_valid > 0:
             inter_answer_loss_mean = inter_answer_loss_sum / inter_answer_n_valid.clamp(min=1).float()
@@ -1298,7 +1353,9 @@ class Lotus(nn.Module):
             inter_answer_loss_mean = torch.tensor(0.0, device=input_ids.device)
 
         return Outputs(
-            loss=loss if total_valid_cot_tokens > 0 and inter_loss_sum_raw > 0 else lm_loss,
+            loss=lm_loss + self.intermediate_loss_weight * intermediate_loss_mean
+                 + self.codi_loss_weight * codi_loss + self.student_cot_loss_weight * cot_loss
+                 + self.inter_answer_loss_weight * inter_answer_loss_mean,
             inputs_embeds=inputs_embeds, logits=logits,
             intermediate_logits=intermediate_logits,
             main_loss=lm_loss, intermediate_loss=intermediate_loss_mean,
@@ -1308,7 +1365,20 @@ class Lotus(nn.Module):
             inter_answer_loss=inter_answer_loss_mean,
             inter_answer_loss_sum=inter_answer_loss_sum,
             n_inter_answer_valid=inter_answer_n_valid,
+            student_cot_loss=cot_loss, student_cot_loss_sum=cot_sum, n_student_cot_valid=cot_count,
         )
+
+    def _research_losses(self, input_ids, attention_mask, answer_labels, replaced_cot_steps,
+                         student_hidden, hidden_offset, need_kd, need_aux):
+        if not (need_kd or need_aux):
+            zero = input_ids.new_zeros((), dtype=torch.float32)
+            count = input_ids.new_zeros(())
+            return zero, count, zero, count
+        explicit = reconstruct_explicit_batch(input_ids, attention_mask, answer_labels,
+                                             replaced_cot_steps, self.start_latent_id,
+                                             self.end_latent_id, self.pad_token_id, hidden_offset)
+        return cross_size_losses(self.base_causallm, self.teacher_model, self.distill_alignment,
+                                 explicit, student_hidden, need_kd, need_aux)
 
     def _compute_codi_loss(
         self,

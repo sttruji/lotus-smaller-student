@@ -10,7 +10,6 @@ import os
 import random
 import sys
 from copy import copy
-from pathlib import Path
 
 import numpy as np
 import shutil
@@ -20,7 +19,6 @@ import torch.distributed
 import torch.distributed as dist
 import torch.optim as optim
 import wandb
-import yaml
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullOptimStateDictConfig, FullStateDictConfig, StateDictType
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -44,47 +42,11 @@ from dataset import (
 )
 from lotus import Lotus
 from utils import Config, set_seed
-
-
-def load_hierarchical_yaml(config_path):
-    """
-    Load a YAML config that may inherit from base configs.
-    Supports 'base' key with a single file path or list of file paths.
-    Configs are merged in order, with later configs overriding earlier ones.
-    """
-    config_path = Path(config_path)
-
-    with open(config_path) as f:
-        config = yaml.safe_load(f)
-
-    # If no base configs, return as-is
-    if "base" not in config:
-        return config
-
-    # Get base config paths
-    base_paths = config.pop("base")
-    if isinstance(base_paths, str):
-        base_paths = [base_paths]
-
-    # Load and merge base configs
-    merged_config = {}
-    for base_path in base_paths:
-        # Resolve relative to args directory
-        if not base_path.startswith("/"):
-            base_path = config_path.parent / base_path
-        else:
-            base_path = Path(base_path)
-
-        # Recursively load base config (supports multi-level inheritance)
-        base_config = load_hierarchical_yaml(base_path)
-
-        # Merge base config into merged_config
-        merged_config.update(base_config)
-
-    # Override with current config values
-    merged_config.update(config)
-
-    return merged_config
+from configuration import load_hierarchical_yaml, apply_overrides, accumulation_divisor
+from distillation import load_teacher
+from run_metadata import write_run_manifest
+from preflight_distillation import validate_configuration
+from inference_model import build_inference_model
 
 
 def main():
@@ -92,7 +54,12 @@ def main():
     parser = argparse.ArgumentParser(description="looped")
     parser.add_argument("config_file")
     parser.add_argument("--name", type=str, default=None, help="Override run name")
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="Override an existing YAML key; repeat as needed")
     args = parser.parse_args()
+
+    config_dict = apply_overrides(load_hierarchical_yaml(args.config_file), args.set)
+    validate_configuration(config_dict)
+    accumulation_steps = int(config_dict.get("gradient_accumulation_steps", 1))
 
     # init distributed environment
     dist.init_process_group("nccl")
@@ -100,9 +67,6 @@ def main():
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
-
-    # load the configuration file with hierarchical support
-    config_dict = load_hierarchical_yaml(args.config_file)
 
     # Apply CLI overrides
     if args.name is not None:
@@ -184,8 +148,9 @@ def main():
                 f"but allow_resume_from_checkpoint is set to False. Starting training from scratch."
             )
 
-    model = AutoModelForCausalLM.from_pretrained(configs.model_id)
-    tokenizer = AutoTokenizer.from_pretrained(configs.model_id)
+    load_dtype = torch.bfloat16 if configs.bf16 else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(configs.model_id, revision=getattr(configs, "model_revision", None), torch_dtype=load_dtype)
+    tokenizer = AutoTokenizer.from_pretrained(configs.model_id, revision=getattr(configs, "model_revision", None))
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.add_tokens("<|start-latent|>")
     tokenizer.add_tokens("<|end-latent|>")
@@ -196,13 +161,15 @@ def main():
 
     loaded = False
     saved_weights = None  # Initialize early so we can check vocab size
+    hf_model = None
 
     if configs.load_model_path is not None and configs.load_model_path != "None":
         # Check if it's a Hugging Face repo ID (doesn't start with / or .)
         if not configs.load_model_path.startswith(('/', '.', '~')):
             # Load from Hugging Face Hub (model-agnostic: GPT-2, Llama, etc.)
             print(f"Loading model from Hugging Face: {configs.load_model_path}")
-            hf_model = AutoModelForCausalLM.from_pretrained(configs.load_model_path)
+            hf_model = AutoModelForCausalLM.from_pretrained(configs.load_model_path, revision=getattr(configs, "student_revision", None), torch_dtype=load_dtype)
+            config_dict["student_initialization_commit"] = getattr(hf_model.config, "_commit_hash", None)
             saved_weights = hf_model.state_dict()
         else:
             # Load from local path (supports both file and directory checkpoints)
@@ -299,6 +266,9 @@ def main():
         configs.c_thought = 0
         configs.looped = False
 
+    if getattr(configs, "gradient_checkpointing", False) and not configs.only_eval:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
     if configs.looped:
         # Check if KV cache should be used (default: True so latent tokens attend to prefix)
         use_kv_cache = getattr(configs, "use_kv_cache", True)
@@ -311,52 +281,14 @@ def main():
         teacher_model = None
         codi_loss_weight = getattr(configs, "codi_loss_weight", 0.0)
         codi_loss_type = getattr(configs, "codi_loss_type", "smooth_l1")
-        teacher_model_path = getattr(configs, "teacher_model_path", None)
 
         # Load teacher model if any distillation loss needs it
         _need_teacher = (codi_loss_weight > 0)
-        if teacher_model_path is not None and _need_teacher:
+        if _need_teacher:
+            teacher_model = load_teacher(configs, tokenizer, local_rank)
             if rank == 0:
-                print(f"Loading teacher model from {teacher_model_path}")
-
-            teacher_model = AutoModelForCausalLM.from_pretrained(
-                configs.model_id,
-                torch_dtype=torch.bfloat16 if configs.bf16 else torch.float32,
-            )
-
-            # Resolve teacher weights. Supports a Hugging Face repo id (same
-            # convention as load_model_path: no leading '/', '.', or '~') or a
-            # local checkpoint file/dir.
-            teacher_load_path = teacher_model_path
-            if not teacher_load_path.startswith(("/", ".", "~")):
-                # Hugging Face repo id
-                hf_teacher = AutoModelForCausalLM.from_pretrained(teacher_load_path)
-                teacher_model.load_state_dict(hf_teacher.state_dict(), strict=False)
-                del hf_teacher
-            else:
-                if os.path.isdir(teacher_load_path):
-                    model_file = os.path.join(teacher_load_path, "model.pt")
-                    if os.path.exists(model_file):
-                        teacher_load_path = model_file
-                if teacher_load_path not in ("None", "none", "") and os.path.exists(teacher_load_path):
-                    teacher_weights = torch.load(teacher_load_path, map_location=torch.device(rank), weights_only=False)
-
-                    # Handle base_causallm keys if it's a looped checkpoint
-                    if any(k.startswith("base_causallm") for k in teacher_weights.keys()):
-                        teacher_weights = {
-                            k.replace("base_causallm.", ""): v
-                            for k, v in teacher_weights.items()
-                            if k.startswith("base_causallm")
-                        }
-
-                    teacher_model.load_state_dict(teacher_weights, strict=False)
-                elif rank == 0:
-                    print(f"No teacher checkpoint file found at '{teacher_model_path}', using base HF model as teacher")
-
-            teacher_model = teacher_model.to(rank)
-
-            if rank == 0:
-                print(f"Teacher model loaded, codi_loss_weight={codi_loss_weight}, codi_loss_type={codi_loss_type}")
+                print(f"Frozen teacher: {teacher_model.config._name_or_path}, "
+                      f"width={teacher_model.config.hidden_size}, layers={teacher_model.config.num_hidden_layers}")
 
         model = Lotus(
             model,
@@ -382,6 +314,11 @@ def main():
             flat_intermediate_supervision=getattr(configs, "flat_intermediate_supervision", False),
             ia_loss_after_loop=getattr(configs, "ia_loss_after_loop", False),
             latent_injection_mode=getattr(configs, "latent_injection_mode", "add"),
+            codi_alignment=getattr(configs, "codi_alignment", "legacy"),
+            distillation_epsilon=getattr(configs, "distillation_epsilon", 1e-6),
+            student_cot_loss_weight=getattr(configs, "student_cot_loss_weight", 0.0),
+            main_answer_only=getattr(configs, "main_answer_only", False),
+            require_smaller_student=getattr(configs, "require_smaller_student", False),
         )
 
     # If resuming AND the checkpoint contains ia_decoder weights, we need the
@@ -415,7 +352,8 @@ def main():
         _ia_pre_created = True
 
     if configs.load_model_path is not None and configs.load_model_path != "None" and not loaded:
-        print(model.load_state_dict(saved_weights, strict=False))
+        strict_resume = getattr(configs, "codi_alignment", "legacy") != "legacy" and any(k.startswith("base_causallm.") for k in saved_weights)
+        print(model.load_state_dict(saved_weights, strict=strict_resume))
 
     # Initialize the base-copy IA decoder AFTER load_state_dict so the deep
     # copy inherits the loaded checkpoint weights. Skip if already pre-created
@@ -462,6 +400,10 @@ def main():
             model.init_ia_decoder_from_path(_ia_init_path)
 
     print(f"Running FSDP on rank = {rank}, world size = {world_size}")
+    saved_weights = None
+    hf_model = None
+    if rank == 0 and not configs.only_eval:
+        write_run_manifest(save_dir, config_dict, model, world_size)
     model = model.to(rank)
 
     llama_auto_wrap_policy = functools.partial(
@@ -491,19 +433,22 @@ def main():
         print(parallel_model)
 
     # prepare the ground truth answer and cot for evaluation
-    question_val = [d["question"] for d in json.load(open(configs.val_path))]
+    val_limit = getattr(configs, "val_max_examples", None) or (32 if configs.debug else 100000000)
+    train_limit = getattr(configs, "train_max_examples", None) or (5000 if configs.debug else 100000000)
+    val_rows = json.load(open(configs.val_path))[:val_limit]
+    question_val = [d["question"] for d in val_rows]
     answers_val = [
-        d["answer"].replace(",", "").strip() for d in json.load(open(configs.val_path))
+        d["answer"].replace(",", "").strip() for d in val_rows
     ]
-    cot_val = ["\n".join(d["steps"]) for d in json.load(open(configs.val_path))]
+    cot_val = ["\n".join(d["steps"]) for d in val_rows]
 
     base_dataset_valid = get_dataset(
-        configs.val_path, tokenizer, max_size=32 if configs.debug else 100000000
+        configs.val_path, tokenizer, max_size=val_limit
     )
 
     if not configs.only_eval:
         base_dataset_train = get_dataset(
-            configs.train_path, tokenizer, max_size=5000 if configs.debug else 100000000
+            configs.train_path, tokenizer, max_size=train_limit
         )
 
         # Automatically set c_thought to max CoT step length if auto_c_thought is enabled
@@ -527,6 +472,7 @@ def main():
         max_new_tokens = 64
     else:
         max_new_tokens = 128
+    max_new_tokens = int(getattr(configs, "max_new_tokens", max_new_tokens))
 
     total_train_steps = 0
 
@@ -558,7 +504,7 @@ def main():
     # For "curriculum" schedule: warmup LR during stage ramp-up, decay after max stage
     lr_min_ratio = getattr(configs, "lr_min_ratio", 0.1)  # min LR = lr * lr_min_ratio
 
-    best_acc = 0
+    best_acc = -1.0
 
     # Determine if we're resuming from a full checkpoint (directory with optimizer/scheduler state)
     resume_checkpoint_dir = None
@@ -713,7 +659,7 @@ def main():
             # re-fire at every stage transition. After warmup the multiplier
             # stays at 1.0 forever, so subsequent epochs see configs.lr.
             if lr_schedule == "constant" and warmup_ratio > 0 and lr_scheduler is None:
-                steps_per_epoch_const = len(train_dataloader)
+                steps_per_epoch_const = (len(train_dataloader) + accumulation_steps - 1) // accumulation_steps
                 # Anchor warmup length to the *first* epoch's step count so
                 # warmup duration is independent of which stage we're in.
                 warmup_steps = max(1, int(steps_per_epoch_const * warmup_ratio))
@@ -733,7 +679,7 @@ def main():
                 # Phase 2: cosine decay from lr to lr * lr_min_ratio
                 warmup_epochs = configs.max_latent_stage * configs.epochs_per_stage
                 total_epochs = configs.num_epochs
-                steps_per_epoch = len(train_dataloader)
+                steps_per_epoch = (len(train_dataloader) + accumulation_steps - 1) // accumulation_steps
                 total_steps = steps_per_epoch * total_epochs
                 decay_start_step = steps_per_epoch * warmup_epochs
                 _curriculum_step_offset = epoch * steps_per_epoch
@@ -784,7 +730,8 @@ def main():
                 # to avoid rank 0 falling behind other ranks in FSDP collectives.
 
                 batch = {
-                    key: batch[key].to(rank) for key in batch.keys() if key not in ["idx", "answer_labels"]
+                    key: batch[key].to(rank) for key in batch.keys()
+                    if key != "idx" and (key != "answer_labels" or use_looped)
                 }
 
                 # Add n_looped_iters parameter if using Lotus
@@ -885,11 +832,23 @@ def main():
                             inter_ans_weight = getattr(configs, "inter_answer_loss_weight", 0.0)
                             loss = loss + inter_ans_weight * inter_ans_loss
 
+                    # Auxiliary explicit student CoT CE uses its own token count.
+                    if hasattr(outputs, 'student_cot_loss_sum'):
+                        n_cot = outputs.n_student_cot_valid.detach().clone().float()
+                        dist.all_reduce(n_cot, op=dist.ReduceOp.SUM)
+                        if n_cot > 0:
+                            loss = loss + getattr(configs, "student_cot_loss_weight", 0.0) * outputs.student_cot_loss_sum * w / n_cot.clamp(min=1)
+
                 else:
                     # Single GPU — local mean is correct
                     loss = outputs.loss
 
-                loss.backward()
+                # FSDP still synchronizes each microbatch, avoiding the full
+                # unsharded gradient memory required by no_sync(). The objective
+                # is an average of globally normalized microbatch means.
+                divisor = accumulation_divisor(step, len(train_dataloader), accumulation_steps)
+                (loss / divisor).backward()
+                update_now = (step + 1) % accumulation_steps == 0 or step + 1 == len(train_dataloader)
 
                 # Gradient norm clipping.
                 # IMPORTANT: FSDP shards parameters across ranks, so each rank's
@@ -900,21 +859,24 @@ def main():
                 # squared norm across shards to get the true global grad norm.
                 grad_norm_clip = getattr(configs, "grad_norm_clip", 1.0)
                 _clip_val = grad_norm_clip if grad_norm_clip > 0 else float('inf')
-                if isinstance(parallel_model, FSDP):
+                if not update_now:
+                    grad_norm = None
+                elif isinstance(parallel_model, FSDP):
                     grad_norm = parallel_model.clip_grad_norm_(_clip_val)
                 else:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         parallel_model.parameters(), _clip_val
                     )
                     
-                optimizer.step()
-                if lr_scheduler is not None:
-                    lr_scheduler.step()
-                optimizer.zero_grad()
-                total_train_steps += 1
+                if update_now:
+                    optimizer.step()
+                    if lr_scheduler is not None:
+                        lr_scheduler.step()
+                    optimizer.zero_grad()
+                    total_train_steps += 1
                 pbar.update(1)
 
-                if wandb_run and rank == 0:
+                if wandb_run and rank == 0 and update_now:
                     _loss_display = loss.detach().float()
                     log_dict = {
                         "train/epoch": epoch + 1,
@@ -934,7 +896,7 @@ def main():
                             # Answer loss disabled by config: log 0 to make this explicit.
                             main_loss_val = 0.0
                         log_dict["train/main_loss"] = main_loss_val
-                    for _attr in ("intermediate_loss", "codi_loss", "inter_answer_loss"):
+                    for _attr in ("intermediate_loss", "codi_loss", "inter_answer_loss", "student_cot_loss"):
                         _v = getattr(outputs, _attr, None)
                         if _v is not None:
                             log_dict[f"train/{_attr}"] = _v.detach().float() if isinstance(_v, torch.Tensor) else _v
@@ -1036,7 +998,8 @@ def main():
                     answer_labels = batch.get("answer_labels", None)
 
                     batch = {
-                        key: batch[key].to(rank) for key in batch.keys() if key not in ["idx", "answer_labels"]
+                        key: batch[key].to(rank) for key in batch.keys()
+                        if key != "idx" and (key != "answer_labels" or use_looped)
                     }
 
                     # Add n_looped_iters parameter if using Lotus
@@ -1095,6 +1058,26 @@ def main():
                         print(f"eval answer-only loss: {total_answer_loss / len(valid_loss_dataloader):.4f}")
 
         # val generation accuracy
+        # Bypassing an FSDP root via .module.generate() leaves root-owned
+        # embedding/head parameters sharded on multi-GPU jobs. For generation,
+        # build an unwrapped, student-only copy from a collectively gathered
+        # full state. Its forwards then need no distributed synchronization.
+        generation_model = parallel_model.module
+        generation_copy = not configs.only_eval and world_size > 1
+        if generation_copy:
+            generation_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+            with FSDP.state_dict_type(parallel_model, StateDictType.FULL_STATE_DICT, generation_policy):
+                generation_state = parallel_model.state_dict()
+            trained_base = parallel_model.module.base_causallm if use_looped else parallel_model.module
+            generation_model = build_inference_model(
+                trained_base.config, generation_state, looped=use_looped,
+                latent_id=latent_id, start_id=start_id, end_id=end_id,
+                eos_id=tokenizer.eos_token_id, pad_id=tokenizer.pad_token_id,
+                c_thought=configs.c_thought,
+                latent_injection_mode=getattr(configs, "latent_injection_mode", "add"),
+            ).to(local_rank)
+            del generation_state
+            gc.collect()
         total_length = len(valid_gen_dataloader)
 
         pbar = tqdm(
@@ -1122,20 +1105,20 @@ def main():
                 answer_cot = cot_val[sample_idx]
                 question = question_val[sample_idx]
 
-                # synced_gpus=True in FSDP mode, as we need to keep # forward pass the same on each device
+                # The unwrapped generation copy has no FSDP collectives.
                 # Add n_looped_iters parameter if using Lotus
                 generate_kwargs = {
                     **batch,
                     "max_new_tokens": max_new_tokens,
-                    "synced_gpus": not configs.only_eval,
+                    "synced_gpus": False,
                 }
                 if use_looped:
                     generate_kwargs["n_looped_iters"] = scheduled_stage
 
                 if use_looped:
-                    outputs, intermediate_tokens = parallel_model.module.generate(output_intermediate=True, **generate_kwargs)
+                    outputs, intermediate_tokens = generation_model.generate(output_intermediate=True, **generate_kwargs)
                 else:
-                    outputs = parallel_model.module.generate(**generate_kwargs)
+                    outputs = generation_model.generate(**generate_kwargs)
                     intermediate_tokens = []
 
                 text_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -1150,7 +1133,7 @@ def main():
                         f"Question {test_idx}: Answer = '{answer}' CoT = '{answer_cot}'"
                     )
                     n_looped_iters_used = generate_kwargs.get('n_looped_iters', 0)
-                    actual_loops = getattr(parallel_model.module if hasattr(parallel_model, 'module') else parallel_model, 'actual_loops_executed', 'unknown')
+                    actual_loops = getattr(generation_model, 'actual_loops_executed', 'unknown')
                     print(f"Full output (n_looped_iters={n_looped_iters_used}, actual={actual_loops}): '{tokenizer.decode(outputs[0])}'")
                     print(f"Extracted Output: '{answer_output}'")
                     
@@ -1172,6 +1155,11 @@ def main():
             pbar.close()
             print(f"Device {rank}: local_cor={int(test_results.sum().item())}, local_cot={int(test_cot_results.sum().item())}")
 
+        del generation_model
+        if generation_copy:
+            gc.collect()
+            torch.cuda.empty_cache()
+
         # MAX so duplicated samples from DistributedSampler padding are counted once
         dist.all_reduce(test_results, op=dist.ReduceOp.MAX)
         dist.all_reduce(test_cot_results, op=dist.ReduceOp.MAX)
@@ -1190,7 +1178,8 @@ def main():
         # Best-model selection: save checkpoint_final when validation accuracy improves.
         if not configs.only_eval:
             val_acc = cor / total
-            if val_acc > best_acc and not configs.debug:
+            eligible_stage = not getattr(configs, "replace_all_cot_at_max_stage", False) or scheduled_stage >= configs.max_latent_stage
+            if eligible_stage and val_acc > best_acc and not configs.debug:
                 best_acc = val_acc
                 save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
                 with FSDP.state_dict_type(parallel_model, StateDictType.FULL_STATE_DICT, save_policy):
@@ -1198,6 +1187,11 @@ def main():
                     if rank == 0:
                         final_ckpt_path = os.path.join(save_dir, "checkpoint_final")
                         torch.save(states, final_ckpt_path)
+                        with open(os.path.join(save_dir, "checkpoint_final_metadata.json"), "w") as f:
+                            json.dump({"epoch": epoch + 1, "scheduled_stage": scheduled_stage,
+                                       "c_thought": configs.c_thought, "val_accuracy": val_acc,
+                                       "all_cot_removed": bool(getattr(configs, "replace_all_cot_at_max_stage", False)
+                                                               and scheduled_stage >= configs.max_latent_stage)}, f, indent=2)
                         print(f"New best val acc: {val_acc:.4f} — saved checkpoint_final")
                 dist.barrier()
                 del states
