@@ -1,255 +1,167 @@
-# Bridging the Gap Between Latent and Explicit Reasoning with Looped Transformers
+# Smaller recurrent student: 3B teacher → looped 1B student
 
-## Smaller-student research branch
+Research fork of [LOTUS](https://github.com/yingfan-bot/lotus) for distilling an
+explicit 3B chain-of-thought teacher into a smaller 1B student that reuses its
+transformer weights across latent reasoning passes.
 
-This branch adds frozen **3B explicit teacher → recurrent 1B student** distillation,
-cross-size layer/width alignment, explicit CoT-SFT baselines, compute-node launch
-configs and student-only export. See [RESEARCH_SCAFFOLD.md](RESEARCH_SCAFFOLD.md)
-for the design, tested paths, setup and training commands.
+The student is fully fine-tuned with answer CE, hidden-state distillation and an
+auxiliary explicit CoT objective. The teacher is frozen. At the final curriculum
+stage, the main student input contains the question and latent region with all
+written rationale removed.
 
-```bash
-python scripts/smoke_distillation.py --steps 3  # CPU, no model downloads
-NPROC_PER_NODE=1 bash launch_distillation.sh  # Allocated CUDA node, prepared data/environment
-```
+The current code is on **main** in
+[sttruji/lotus-smaller-student](https://github.com/sttruji/lotus-smaller-student).
+The original handoff bundle and scaffold branch predate the checkpoint and
+evaluation fixes.
 
-The upstream paper implementation and configuration files are retained below.
+## Documentation
 
-This project is for the paper: [Bridging the Gap Between Latent and Explicit Reasoning with Looped Transformers](https://arxiv.org/abs/2606.31779).
+| Guide | Contents |
+| --- | --- |
+| [Research scaffold](RESEARCH_SCAFFOLD.md) | Architecture, objectives, environment, controlled baselines, training, resume and export |
+| [Training batches](docs/TRAINING_BATCHES.md) | Recorded 2/64 and 8/16 options, effective batch 128, paper settings and accumulation behavior |
+| [A100 planning](docs/A100_PLANNING.md) | Data counts, runtime assumptions, training memory estimates and GPU profiling work |
+| [Evaluation](docs/EVALUATION.md) | Strict loading, generation/scoring, failures, truncation, timing and metrics |
+| [Audit status](docs/AUDIT_STATUS.md) | Completed fixes, existing CPU evidence and remaining validation |
+| [Upstream LOTUS](docs/UPSTREAM_LOTUS.md) | Original method configs, launch commands, published models and citations |
 
-<!-- Project Page URL assumes GitHub Pages is enabled (Settings -> Pages -> deploy from branch: main, folder: /docs) on the public yingfan-bot/lotus repo. -->
-🔗 **[Project Page](https://yingfan-bot.github.io/lotus/)** &nbsp;·&nbsp; 📄 **[arXiv](https://arxiv.org/abs/2606.31779)** &nbsp;·&nbsp; 🤗 **[Models &amp; collection](https://huggingface.co/collections/yingfanbot/looped-padded-6a552f7ef667cb41db2431a3)** &nbsp;·&nbsp; 𝕏 **[Summary](https://x.com/yingfan_bot/status/2077441955202482419)**
+## Current experiment
+
+| Setting | Main research configuration |
+| --- | --- |
+| Student initialization | yingfanbot/gsm-cot-llama1b |
+| Frozen teacher | yingfanbot/gsm-cot-llama3b |
+| Student / teacher blocks | 16 / 28 |
+| Student / teacher hidden width | 2,048 / 3,072 |
+| Alignment | Relative-depth mapping with one bias-free student-to-teacher projection per pair |
+| Training-only projections | 100,663,296 parameters |
+| Objective | Answer CE + normalized L1 KD at weight 1.0 + explicit student CoT CE at weight 0.1 |
+| Curriculum | Ten epochs; stages 0, 1, 2, 3, 4, 5, 6, 6, 6, 6 |
+| Saturated latent region | 150 positions; initial pass plus six additional passes |
+| Training stack | BF16, activation checkpointing, PyTorch AdamW and native FSDP |
+| Export | Student backbone, tokenizer and lotus_config.json; recurrence uses the LOTUS wrapper |
+
+The published initialization is convenient for a pilot. A controlled study first
+trains the 1B and 3B CoT baselines on the same prepared splits and then uses those
+exact checkpoints for all distillation comparisons. See
+[controlled training](RESEARCH_SCAFFOLD.md#train-the-controlled-baselines-then-distill).
+
+## Setup on a CUDA node
+
+Clone the current repository:
+
+~~~bash
+git clone https://github.com/sttruji/lotus-smaller-student.git
+cd lotus-smaller-student
+conda env create -f environment.yml
+conda activate lotus
+bash preprocessing/gsm_icot.bash
+~~~
+
+The environment specifies Python 3.12 and PyTorch 2.7.0 with CUDA 12.8.
+[requirements.txt](requirements.txt) provides the remaining runtime dependencies;
+it does not install PyTorch. An alternative is the prepared
+nvcr.io/nvidia/pytorch:25.03-py3 container plus those requirements. See the
+[environment guide](RESEARCH_SCAFFOLD.md#environment-and-data).
+
+Preprocessing creates data/gsm_train.json, data/gsm_valid.json and
+data/gsm_test.json from the pinned augmented GSM8K source. Data, checkpoints and
+run outputs are git-ignored. Authenticate with huggingface-cli login if the
+selected models require Hub access. The research launcher disables W&B by default.
+
+## Recorded single-GPU batch options
+
+Both options target **128 examples per optimizer update**:
+
+| Use | GPU microbatch | Accumulation steps | Status |
+| --- | ---: | ---: | --- |
+| Initial configuration | 2 | 64 | Start here; actual A100 memory is unmeasured |
+| Throughput candidate | 8 | 16 | Profile at the fully latent stage before a full run |
+
+The shared YAML pilot defaults remain microbatch 2 and accumulation 16, which
+produce effective batch 32 on one GPU. The commands below explicitly request 128.
+
+~~~bash
+# Initial 2/64 option, using the published CoT initialization.
+NPROC_PER_NODE=1 RUN_NAME=gsm-distill-b128-mb2-seed0 \
+bash launch_distillation.sh \
+  --set batch_size_training=2 --set gradient_accumulation_steps=64
+
+# Candidate 8/16 option, after measuring fully latent memory.
+NPROC_PER_NODE=1 RUN_NAME=gsm-distill-b128-mb8-seed0 \
+bash launch_distillation.sh \
+  --set batch_size_training=8 --set gradient_accumulation_steps=16
+~~~
+
+Effective batch is microbatch per GPU × accumulation × GPU count. When using
+more GPUs, adjust accumulation to retain 128. For a bounded GPU pilot and Slurm
+commands, see [training batches](docs/TRAINING_BATCHES.md).
+
+## Export and evaluate
+
+For a controlled run named gsm-distill-controlled-seed0:
+
+~~~bash
+python scripts/export_student.py \
+  --checkpoint ./outputs/gsm-distill-controlled-seed0/checkpoint_final \
+  --manifest ./outputs/gsm-distill-controlled-seed0/run_manifest.json \
+  --output-dir ./outputs/student-inference
+
+python scripts/eval.py \
+  --model_id ./outputs/student-inference --datasets gsm8k \
+  --max_new_tokens 512 \
+  --save_preds ./outputs/student-predictions.json \
+  --save_metrics ./outputs/student-metrics.json
+~~~
+
+Local exports supply inference defaults through lotus_config.json. Raw
+checkpoints require the matching backbone and loop settings. The evaluator
+rejects incomplete weights, records every attempted example, reports truncation
+and uses a synchronized full-generation timer for inference comparisons.
+Generation errors produce a nonzero exit status. Read the
+[evaluation guide](docs/EVALUATION.md) for denominators, split selection and timing scope.
+
+## Validation status
+
+As of 2026-10-01, the existing suite passed **54 CPU tests** with tiny local
+models, including cross-size gradients, frozen-teacher behavior, checkpoint
+selection, export/reload and complete evaluator runs. The CPU smoke completed
+three optimizer updates.
+
+Real-model accuracy, A100 memory/throughput, CUDA execution, Slurm and multi-GPU
+FSDP still require compute-node validation. The runtime and VRAM figures in
+[A100 planning](docs/A100_PLANNING.md) are estimates. The standalone evaluator
+currently runs one example at a time with no warmup exclusion or batched
+throughput benchmark.
 
 ## Repository layout
 
-```text
-.
-├── args/                    # YAML training/evaluation configs
-├── data/                    # JSON datasets used by the provided configs
-├── preprocessing/           # GSM8K download + preprocessing scripts
-├── launch_train.sh          # Public torch.distributed launcher
-├── environment.yml          # Conda env (Python 3.12, PyTorch 2.7 + CUDA 12.8)
-├── requirements.txt         # Python deps layered on top of the NGC image
-└── scripts/                 # Python entry points and modules
-    ├── run.py               # Main training entry point
-    ├── eval.py              # Standalone evaluation entry point
-    ├── dataset.py           # Data loading/collation utilities
-    ├── lotus.py             # LOTUS latent reasoning model wrapper
-    └── utils.py             # Config and seed helpers
-```
+~~~text
+args/research/           Controlled experiment and ablation configs
+args/gsm8k_*.yaml        Retained upstream method configs
+scripts/run.py          Custom training and validation loop
+scripts/lotus.py        Recurrent student and generation
+scripts/distillation.py Teacher loading and boundary alignment
+scripts/selection_state.py  Resume-safe checkpoint selection
+scripts/export_student.py  Student-only HF export
+scripts/eval.py         Standalone evaluator
+scripts/eval_accounting.py  Scoring and evaluation accounting
+scripts/preflight_distillation.py  Configuration/data/model checks
+scripts/run_metadata.py Run provenance manifests
+launch_distillation.sh  Research launcher; CLI overrides and one GPU by default
+launch_train.sh         Original method launcher; four GPUs by default
+cluster/                Slurm template
+preprocessing/          Dataset preparation
+tests/                  CPU correctness coverage
+docs/                   Batching, evaluation, resource planning and audit guides
+~~~
 
-## Environment
+## Attribution and license
 
-We recommend the NVIDIA NGC PyTorch image (it provides a CUDA-matched PyTorch stack, so
-`requirements.txt` does not install `torch`):
+Built on [LOTUS](https://arxiv.org/abs/2606.31779), with
+[CODI-style hidden-state distillation](https://arxiv.org/abs/2502.21074).
+The original training, evaluation and preprocessing code is adapted from
+[Coconut](https://github.com/facebookresearch/coconut). Published upstream models
+and results are described in [the upstream guide](docs/UPSTREAM_LOTUS.md).
 
-```text
-nvcr.io/nvidia/pytorch:25.03-py3
-```
-
-### Docker
-
-From the repository root:
-
-```bash
-docker run --gpus all --rm -it \
-  --ipc=host \
-  --ulimit memlock=-1 \
-  --ulimit stack=67108864 \
-  -v "$PWD":/workspace/lotus \
-  -w /workspace/lotus \
-  nvcr.io/nvidia/pytorch:25.03-py3
-
-pip install -r requirements.txt
-```
-
-### Conda environment
-
-If you are not using a container, an `environment.yml` is provided that mirrors the NGC
-image (Python 3.12, PyTorch 2.7 + CUDA 12.8). From the repository root:
-
-```bash
-conda env create -f environment.yml
-conda activate lotus
-```
-
-## Authentication
-
-If you need private Hugging Face models or W&B logging, log in before launching:
-
-```bash
-huggingface-cli login
-wandb login
-```
-
-The launcher itself does not handle credentials.
-
-## Data
-
-The configs read JSON splits of the form `{"question", "steps", "answer"}` from `./data/`
-(git-ignored, not shipped). To download and preprocess the augmented-CoT GSM8K splits into
-that format, run from the repo root:
-
-```bash
-bash preprocessing/gsm_icot.bash
-```
-
-This produces `data/gsm_{train,valid,test}.json`. The scripts under
-[`preprocessing/`](preprocessing) are adapted from
-[Coconut](https://github.com/facebookresearch/coconut) and pull the augmented GSM8K data
-from [Internalize_CoT_Step_by_Step](https://github.com/da03/Internalize_CoT_Step_by_Step).
-
-## Configuration
-
-Each run is configured by a YAML file passed to `scripts/run.py` (via `CONFIG`). Configs compose
-through a `base:` chain under [`args/base/`](args/base) (shared defaults → model → method
-→ dataset), so each leaf config in [`args/`](args) only overrides what it needs, and every
-field is documented inline in the YAML. The essentials:
-
-- `looped` — `True` for LOTUS (looped latent training); `cot: True` for plain CoT fine-tuning.
-- `load_model_path` — checkpoint (HF repo id or local path) to initialize LOTUS from a CoT-tuned model, or to evaluate.
-- `c_thought` / `max_latent_stage` / `epochs_per_stage` — latent-token count and curriculum schedule.
-
-## Models
-
-Trained checkpoints are on the Hugging Face Hub — collected in the
-[**LOTUS collection**](https://huggingface.co/collections/yingfanbot/looped-padded-6a552f7ef667cb41db2431a3)
-(paper + models):
-
-| Model | Description | GSM8K (GSM8k-Aug) |
-| --- | --- | --- |
-| [`yingfanbot/gsm-lotus-llama3b`](https://huggingface.co/yingfanbot/gsm-lotus-llama3b) | LOTUS, Llama-3.2-3B | 70.05% |
-| [`yingfanbot/gsm-lotus-llama3b-codi`](https://huggingface.co/yingfanbot/gsm-lotus-llama3b-codi) | LOTUS + CODI, Llama-3.2-3B | 70.58% |
-
-Stage-1 CoT initialization checkpoints:
-[`gsm-cot-gpt2`](https://huggingface.co/yingfanbot/gsm-cot-gpt2),
-[`gsm-cot-llama1b`](https://huggingface.co/yingfanbot/gsm-cot-llama1b),
-[`gsm-cot-llama3b`](https://huggingface.co/yingfanbot/gsm-cot-llama3b).
-
-## Training
-
-Use `launch_train.sh` for distributed training. Important environment variables:
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `CONFIG` | `args/gsm8k_cot_llama1b.yaml` | YAML config passed to `scripts/run.py` |
-| `RUN_NAME` | empty | Optional run-name override |
-| `NPROC_PER_NODE` | `4` | GPUs per node; set to `128 / batch_size_training` so the overall batch is 128 (GPT-2: 2, Llama-1B: 4, Llama-3B: 8) |
-| `MASTER_PORT` | `29500` | Torch distributed master port |
-
-LOTUS is trained in **two stages**: (1) CoT supervised fine-tuning, then (2) looped
-latent training initialized from the Stage-1 checkpoint. Setting `RUN_NAME` controls
-the output directory (`./outputs/<RUN_NAME>/`), which keeps the wiring between the two
-stages predictable.
-
-> By default, the LOTUS configs initialize from the published CoT checkpoints on Hugging Face
-> (`yingfanbot/gsm-cot-{gpt2,llama1b,llama3b}`), so Stage 2 can be run directly without first
-> running Stage 1. To initialize from your own CoT checkpoint instead, set `load_model_path`
-> (and `teacher_model_path`, if CODI distillation is enabled) to
-> `./outputs/<stage-1 RUN_NAME>/checkpoint_final`.
-
-**GPT-2**
-
-```bash
-# Stage 2 — LOTUS (loads the published GPT-2 CoT checkpoint by default)
-CONFIG=args/gsm8k_lotus_gpt2.yaml RUN_NAME=gsm-lotus-gpt2 NPROC_PER_NODE=2 ./launch_train.sh
-
-# (optional) retrain the CoT stage yourself, then point load_model_path at the output:
-# CONFIG=args/gsm8k_cot_gpt2.yaml RUN_NAME=gsm-cot-gpt2 NPROC_PER_NODE=2 ./launch_train.sh
-#   -> ./outputs/gsm-cot-gpt2/checkpoint_final
-```
-
-**Llama-3.2-1B**
-
-```bash
-# Stage 2 — LOTUS (loads the published Llama-1B CoT checkpoint by default)
-CONFIG=args/gsm8k_lotus_llama1b.yaml RUN_NAME=gsm-lotus-llama1b NPROC_PER_NODE=4 ./launch_train.sh
-
-# (optional) retrain the CoT stage yourself, then point load_model_path at the output:
-# CONFIG=args/gsm8k_cot_llama1b.yaml RUN_NAME=gsm-cot-llama1b NPROC_PER_NODE=4 ./launch_train.sh
-#   -> ./outputs/gsm-cot-llama1b/checkpoint_final
-```
-
-**Llama-3.2-3B**
-
-```bash
-# Stage 2 — LOTUS (loads the published Llama-3B CoT checkpoint by default)
-CONFIG=args/gsm8k_lotus_llama3b.yaml RUN_NAME=gsm-lotus-llama3b NPROC_PER_NODE=8 ./launch_train.sh
-
-# (optional) retrain the CoT stage yourself, then point load_model_path (+ teacher_model_path) at the output:
-# CONFIG=args/gsm8k_cot_llama3b.yaml RUN_NAME=gsm-cot-llama3b NPROC_PER_NODE=4 ./launch_train.sh
-#   -> ./outputs/gsm-cot-llama3b/checkpoint_final
-```
-
-## Evaluation
-
-`scripts/eval.py` is the standalone evaluation script (single GPU). It can load weights two ways:
-
-- **Local checkpoint** — pass `--checkpoint ./outputs/<run>/checkpoint_final` (a torch state dict
-  produced by training) together with the matching `--model_id` base model.
-- **Published HF model** — pass `--model_id <hf-repo>` and omit `--checkpoint`; the trained weights load
-  straight from the repo's `safetensors`. `from_pretrained` loads the weights only — the looped padded
-  architecture is provided by the `Lotus` wrapper (`eval.py` runs it), so no separate checkpoint file is needed.
-
-**LOTUS model on GSM8K (local checkpoint):**
-
-```bash
-python scripts/eval.py \
-  --checkpoint ./outputs/gsm-lotus-llama3b/checkpoint_final \
-  --model_id meta-llama/Llama-3.2-3B-Instruct \
-  --datasets gsm8k \
-  --n_looped_iters 6 --c_thought 25 --bf16
-```
-
-**LOTUS model on GSM8K (published HF model — no checkpoint file):**
-
-```bash
-python scripts/eval.py \
-  --model_id yingfanbot/gsm-lotus-llama3b \
-  --datasets gsm8k \
-  --n_looped_iters 6 --c_thought 25 --bf16
-```
-
-**LOTUS model on out-of-distribution sets** (GSM-Hard / MultiArith / SVAMP):
-
-```bash
-python scripts/eval.py \
-  --checkpoint ./outputs/gsm-lotus-llama3b/checkpoint_final \
-  --datasets gsm-hard multi-arith svamp \
-  --n_looped_iters 6 --c_thought 25 --bf16 \
-  --save_preds preds.json
-```
-
-**Plain CoT model** (add `--cot`):
-
-```bash
-python scripts/eval.py \
-  --checkpoint ./outputs/gsm-cot-llama3b/checkpoint_final \
-  --datasets gsm8k --cot --bf16
-```
-
-Match `--n_looped_iters` / `--c_thought` to how the checkpoint was trained — use `--c_thought 13`
-for GPT-2 checkpoints and `--c_thought 25` for Llama-1B/3B (and set `--model_id` to the matching
-base model).
-
-## Citation
-
-If you find it useful, please cite:
-
-```bibtex
-@article{fan2026bridging,
-  title={Bridging the Gap Between Latent and Explicit Reasoning with Looped Transformers},
-  author={Fan, Ying and Svete, Anej and Lee, Kangwook},
-  journal={arXiv preprint arXiv:2606.31779},
-  year={2026}
-}
-```
-
-## License
-
-Released under the MIT License (see [`LICENSE`](LICENSE)).
-
-## Acknowledgements
-
-The training, evaluation, and data-preprocessing code is adapted from
-[Coconut](https://github.com/facebookresearch/coconut)
-(*Training Large Language Models to Reason in a Continuous Latent Space*).
+Released under the [MIT License](LICENSE).

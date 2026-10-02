@@ -1,0 +1,255 @@
+{
+  "sampling": {
+    "seed": 20261001,
+    "examples": 20000,
+    "microbatch": 2
+  },
+  "splits": {
+    "train": {
+      "examples": 385620,
+      "sha256": "0a3909a9e7d8d2f7ad6b8c7b5608aa744988d835f9bf874d4cf06ca77df6bf8c"
+    },
+    "valid": {
+      "examples": 500,
+      "sha256": "04f9bddfe8ac4846571b1e2b612b289c95770b5012fdb34cc36a597b041afb87"
+    },
+    "test": {
+      "examples": 1319,
+      "sha256": "e464efa2713fbcf423bdbfb482c543a6a086188c3d97c294b1d19a70c2a515e8"
+    }
+  },
+  "question_tokens": {
+    "mean": 45.31865,
+    "p50": 43,
+    "p95": 70,
+    "p99": 88,
+    "sample_max": 155
+  },
+  "rationale_tokens": {
+    "mean": 20.49105,
+    "p50": 19,
+    "p95": 40,
+    "p99": 55,
+    "sample_max": 123
+  },
+  "explicit_total_tokens": {
+    "mean": 70.0883,
+    "p50": 67,
+    "p95": 109,
+    "p99": 134,
+    "sample_max": 218
+  },
+  "parameters": {
+    "student": 1235820544,
+    "teacher": 3212749824,
+    "training_projections": 100663296
+  },
+  "persistent_memory_gib": {
+    "trainable_weights": 2.4893951416015625,
+    "gradients": 2.4893951416015625,
+    "bf16_adam_moments": 4.978790283203125,
+    "teacher_weights": 5.984212875366211
+  },
+  "stages": [
+    {
+      "stage": 0,
+      "main_padded_tokens": {
+        "mean": 83.4827,
+        "p50": 80,
+        "p95": 123,
+        "p99": 145.01000000000022,
+        "sample_max": 220
+      },
+      "aux_padded_tokens": {
+        "mean": 81.4827,
+        "p50": 78,
+        "p95": 121,
+        "p99": 143.01000000000022,
+        "sample_max": 218
+      },
+      "teacher_padded_tokens": {
+        "mean": 77.1242,
+        "p50": 74,
+        "p95": 116,
+        "p99": 139,
+        "sample_max": 214
+      },
+      "student_body_token_visits_mean": 164.9654,
+      "estimated_flops_per_example": 1979063932684.288
+    },
+    {
+      "stage": 1,
+      "main_padded_tokens": {
+        "mean": 102.0655,
+        "p50": 99,
+        "p95": 141,
+        "p99": 164,
+        "sample_max": 236
+      },
+      "aux_padded_tokens": {
+        "mean": 81.4827,
+        "p50": 78,
+        "p95": 121,
+        "p99": 143.01000000000022,
+        "sample_max": 218
+      },
+      "teacher_padded_tokens": {
+        "mean": 77.1242,
+        "p50": 74,
+        "p95": 116,
+        "p99": 139,
+        "sample_max": 214
+      },
+      "student_body_token_visits_mean": 340.6006,
+      "estimated_flops_per_example": 3588034201421.824
+    },
+    {
+      "stage": 2,
+      "main_padded_tokens": {
+        "mean": 119.3981,
+        "p50": 116,
+        "p95": 158,
+        "p99": 181,
+        "sample_max": 252
+      },
+      "aux_padded_tokens": {
+        "mean": 81.4827,
+        "p50": 78,
+        "p95": 121,
+        "p99": 143.01000000000022,
+        "sample_max": 218
+      },
+      "teacher_padded_tokens": {
+        "mean": 77.1242,
+        "p50": 74,
+        "p95": 116,
+        "p99": 139,
+        "sample_max": 214
+      },
+      "student_body_token_visits_mean": 511.4594,
+      "estimated_flops_per_example": 5026170616714.444
+    },
+    {
+      "stage": 3,
+      "main_padded_tokens": {
+        "mean": 138.6355,
+        "p50": 134,
+        "p95": 175,
+        "p99": 198,
+        "sample_max": 266
+      },
+      "aux_padded_tokens": {
+        "mean": 81.4827,
+        "p50": 78,
+        "p95": 121,
+        "p99": 143.01000000000022,
+        "sample_max": 218
+      },
+      "teacher_padded_tokens": {
+        "mean": 77.1242,
+        "p50": 74,
+        "p95": 116,
+        "p99": 139,
+        "sample_max": 214
+      },
+      "student_body_token_visits_mean": 734.223,
+      "estimated_flops_per_example": 6897664163268.608
+    },
+    {
+      "stage": 4,
+      "main_padded_tokens": {
+        "mean": 160.7276,
+        "p50": 157,
+        "p95": 192,
+        "p99": 215,
+        "sample_max": 284
+      },
+      "aux_padded_tokens": {
+        "mean": 81.4827,
+        "p50": 78,
+        "p95": 121,
+        "p99": 143.01000000000022,
+        "sample_max": 218
+      },
+      "teacher_padded_tokens": {
+        "mean": 77.1242,
+        "p50": 74,
+        "p95": 116,
+        "p99": 139,
+        "sample_max": 214
+      },
+      "student_body_token_visits_mean": 1009.8413,
+      "estimated_flops_per_example": 9211407059676.365
+    },
+    {
+      "stage": 5,
+      "main_padded_tokens": {
+        "mean": 184.6328,
+        "p50": 182,
+        "p95": 212,
+        "p99": 233,
+        "sample_max": 300
+      },
+      "aux_padded_tokens": {
+        "mean": 81.4827,
+        "p50": 78,
+        "p95": 121,
+        "p99": 143.01000000000022,
+        "sample_max": 218
+      },
+      "teacher_padded_tokens": {
+        "mean": 77.1242,
+        "p50": 74,
+        "p95": 116,
+        "p99": 139,
+        "sample_max": 214
+      },
+      "student_body_token_visits_mean": 1337.2727,
+      "estimated_flops_per_example": 11957648663885.414
+    },
+    {
+      "stage": 6,
+      "main_padded_tokens": {
+        "mean": 209.0407,
+        "p50": 207,
+        "p95": 234,
+        "p99": 252,
+        "sample_max": 311
+      },
+      "aux_padded_tokens": {
+        "mean": 81.4827,
+        "p50": 78,
+        "p95": 121,
+        "p99": 143.01000000000022,
+        "sample_max": 218
+      },
+      "teacher_padded_tokens": {
+        "mean": 77.1242,
+        "p50": 74,
+        "p95": 116,
+        "p99": 139,
+        "sample_max": 214
+      },
+      "student_body_token_visits_mean": 1715.2068,
+      "estimated_flops_per_example": 15124122039120.281
+    }
+  ],
+  "microbatches_ten_epochs": 1928100,
+  "optimizer_updates_ten_epochs": 120510,
+  "dense_compute_proxy_exaflops": 38.23672058135321,
+  "hours_at_sustained_tflops": {
+    "50": 212.4262254519623,
+    "75": 141.61748363464153,
+    "100": 106.21311272598115,
+    "150": 70.80874181732077,
+    "312": 34.042664335250365
+  },
+  "documentation_context": {
+    "recorded": "2026-10-01",
+    "code_basis": "6f58ae74999c83a359ca99a94b7f8bfd65b097d5",
+    "measured_on_a100": false,
+    "historical_accumulation_steps": 16,
+    "historical_effective_batch": 32,
+    "note": "Historical sampled-data and arithmetic snapshot. Optimizer updates describe 2/16. See A100_PLANNING.md for recorded 2/64 and 8/16 batch-128 options; no GPU capacity or runtime was measured."
+  }
+}
