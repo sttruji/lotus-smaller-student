@@ -220,6 +220,10 @@ RUN_NAME=gsm-distill-controlled-seed0 bash launch_distillation.sh \
 Upstream retention keeps only the latest periodic checkpoint. Substitute the
 checkpoint that actually exists; resuming restores epoch-level progress and
 optimizer/scheduler state, not an interrupted mid-epoch dataloader position.
+Periodic checkpoint selection scores are updated after validation. Resume also
+reconciles the score with the existing final checkpoint metadata, protecting a
+better final model when resuming an older checkpoint written before that update.
+For this experiment, only fully latent final checkpoint metadata is eligible.
 
 Export the best fully latent student:
 

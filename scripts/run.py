@@ -47,6 +47,7 @@ from distillation import load_teacher
 from run_metadata import write_run_manifest
 from preflight_distillation import validate_configuration
 from inference_model import build_inference_model
+from selection_state import restore_best_accuracy, update_checkpoint_best_accuracy
 
 
 def main():
@@ -541,7 +542,7 @@ def main():
         if os.path.exists(training_state_path):
             training_state = torch.load(training_state_path, map_location="cpu", weights_only=False)
             total_train_steps = training_state.get("total_train_steps", 0)
-            best_acc = training_state.get("best_acc", 0)
+            best_acc = training_state.get("best_acc", -1.0)
             # Restore RNG states for reproducibility
             if "rng_state" in training_state:
                 random.setstate(training_state["rng_state"]["python"])
@@ -551,6 +552,15 @@ def main():
             if rank == 0:
                 print(f"Restored training state: total_train_steps={total_train_steps}, best_acc={best_acc}")
             del training_state
+
+    if configs.resume != 0:
+        restored_best = restore_best_accuracy(
+            save_dir, best_acc,
+            require_fully_latent=getattr(configs, "replace_all_cot_at_max_stage", False),
+        )
+        if rank == 0 and restored_best > best_acc:
+            print(f"Recovered best val acc from final checkpoint metadata: {restored_best}")
+        best_acc = restored_best
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
 
@@ -917,6 +927,7 @@ def main():
             dist.barrier()
 
             # Save periodic checkpoint (model + optimizer + scheduler + RNG states)
+            ckpt_dir = None
             save_every = getattr(configs, "save_every_epochs", 1)
             if not configs.debug and (epoch + 1) % save_every == 0:
                 ckpt_dir = os.path.join(save_dir, f"checkpoint_{epoch + 1}")
@@ -1200,6 +1211,12 @@ def main():
 
         if configs.only_eval:
             break
+
+        # The periodic snapshot is saved before validation for preemption recovery.
+        # Persist this epoch's final selection score after validation completes.
+        # Resume also reconciles final metadata if interrupted between these writes.
+        if rank == 0 and ckpt_dir is not None:
+            update_checkpoint_best_accuracy(ckpt_dir, best_acc)
 
         # Flush all commit=False logs for this epoch
         if wandb_run and rank == 0:
