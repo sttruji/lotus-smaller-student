@@ -524,7 +524,7 @@ class Lotus(nn.Module):
                 output_hidden_states=research_kd,
             )
             # Store KV cache for generation
-            self._last_kv_cache = outputs.past_key_values
+            object.__setattr__(self, "_last_kv_cache", outputs.past_key_values)
 
             logits = outputs.logits
             shift_logits = logits[..., :-1, :].contiguous()
@@ -576,8 +576,9 @@ class Lotus(nn.Module):
         import time as _time_fwd
         _do_timing = getattr(self, '_in_generate', False)
         if _do_timing:
-            torch.cuda.synchronize()
-            _query_start = _time_fwd.time()
+            if input_ids.is_cuda:
+                torch.cuda.synchronize(input_ids.device)
+            _query_start = _time_fwd.perf_counter()
         prefix_kv_cache = None
         if self.use_kv_cache and loop_start > 0:
             # Process prefix once and cache it (embeddings here never change)
@@ -597,9 +598,10 @@ class Lotus(nn.Module):
 
         # Step 2: Initial forward pass through loop region (with prefix cache if available)
         if _do_timing:
-            torch.cuda.synchronize()
-            self._query_prefill_time = _time_fwd.time() - _query_start
-            _thought_start = _time_fwd.time()
+            if input_ids.is_cuda:
+                torch.cuda.synchronize(input_ids.device)
+            self._query_prefill_time = _time_fwd.perf_counter() - _query_start
+            _thought_start = _time_fwd.perf_counter()
         # Clone prefix cache — Llama's DynamicCache is mutable; without cloning,
         # Step 2 would grow it from loop_start → loop_end entries, corrupting it
         # for subsequent loop iterations that also need the original prefix cache.
@@ -1215,10 +1217,13 @@ class Lotus(nn.Module):
                 final_kv_cache = None  # empty cache from gradient checkpointing
         
         # Store KV cache for potential use in generation
-        self._last_kv_cache = final_kv_cache
+        # DynamicCache is an nn.Module in some torch/Transformers versions.
+        # Runtime caches must not become registered children of the model.
+        object.__setattr__(self, "_last_kv_cache", final_kv_cache)
         if _do_timing:
-            torch.cuda.synchronize()
-            self._thought_time = _time_fwd.time() - _thought_start
+            if input_ids.is_cuda:
+                torch.cuda.synchronize(input_ids.device)
+            self._thought_time = _time_fwd.perf_counter() - _thought_start
 
         # Step 4: Process remaining tokens (CoT steps + answer) if they exist
         # CODI loss needs all-layer hidden states from the suffix forward
@@ -1250,7 +1255,7 @@ class Lotus(nn.Module):
                     output_hidden_states=need_suffix_hidden,
                 )
                 # Update stored KV cache to include suffix
-                self._last_kv_cache = outputs.past_key_values
+                object.__setattr__(self, "_last_kv_cache", outputs.past_key_values)
                 if need_suffix_hidden:
                     suffix_all_hidden_states = outputs.hidden_states
             else:
@@ -1567,23 +1572,39 @@ class Lotus(nn.Module):
         self.gen_forward_cnt = 0
 
         assert input_ids.shape[0] == 1, "only support batch_size == 1 now"
+        if max_new_tokens < 1 or n_looped_iters < 0:
+            raise ValueError("max_new_tokens must be positive and n_looped_iters nonnegative")
 
         tokens = input_ids[0].detach().tolist()
 
         import time as _time
 
         labels = input_ids.clone()  # placeholder. not used.
+        if input_ids.is_cuda:
+            torch.cuda.synchronize(input_ids.device)
+        _forward_start = _time.perf_counter()
+        self._query_prefill_time = self._thought_time = 0.0
         self._in_generate = True
-        outputs = self.forward(
-            input_ids,
-            torch.ones_like(input_ids, device=input_ids.device),
-            labels,
-            torch.arange(
-                0, input_ids.shape[1], dtype=torch.long, device=input_ids.device
-            ).reshape(1, -1),
-            n_looped_iters=n_looped_iters,
-        )
-        self._in_generate = False
+        try:
+            outputs = self.forward(
+                input_ids,
+                torch.ones_like(input_ids, device=input_ids.device),
+                labels,
+                torch.arange(
+                    0, input_ids.shape[1], dtype=torch.long, device=input_ids.device
+                ).reshape(1, -1),
+                n_looped_iters=n_looped_iters,
+            )
+        finally:
+            self._in_generate = False
+        if input_ids.is_cuda:
+            torch.cuda.synchronize(input_ids.device)
+        _forward_time = _time.perf_counter() - _forward_start
+        if n_looped_iters == 0 or not (input_ids == self.latent_token_id).any().item():
+            self._query_prefill_time = _forward_time
+        # Includes the final suffix forward and forward bookkeeping that falls
+        # outside the prefix and latent-loop timers.
+        _prefill_other_time = max(0.0, _forward_time - self._query_prefill_time - self._thought_time)
 
         # query_prefill_time and thought_time are set inside forward()
 
@@ -1607,8 +1628,9 @@ class Lotus(nn.Module):
                 intermediate_tokens.append(step_tokens)
 
         # --- Begin answer decode (timing starts here, after intermediate logits bookkeeping) ---
-        torch.cuda.synchronize()
-        _decode_start = _time.time()
+        if input_ids.is_cuda:
+            torch.cuda.synchronize(input_ids.device)
+        _decode_start = _time.perf_counter()
 
         # Collect answer logits (eval only) for entropy analysis
         _answer_logits_list = [] if not self.training else None
@@ -1619,7 +1641,7 @@ class Lotus(nn.Module):
         if _answer_logits_list is not None:
             _answer_logits_list.append(outputs.logits[0, -1:, :].detach())
         # Record per-token decode times: (token_id, generation_time)
-        _decode_token_times = [(next_token, _time.time() - _decode_start)]
+        _decode_token_times = [(next_token, _time.perf_counter() - _decode_start)]
         
         # Use the KV cache already built during forward
         # self._last_kv_cache contains KV for the full sequence after loops
@@ -1628,8 +1650,10 @@ class Lotus(nn.Module):
 
         # Generate tokens one by one using KV cache
         for _ in range(max_new_tokens - 1):
+            if next_token == self.eos_token_id:
+                break
             self.gen_forward_cnt += 1
-            _iter_start = _time.time()
+            _iter_start = _time.perf_counter()
             
             # Forward just the new token with KV cache
             new_token_embed = self.embedding(
@@ -1646,16 +1670,17 @@ class Lotus(nn.Module):
             seq_len += 1
             
             next_token = torch.argmax(outputs.logits[0, -1]).item()  # .item() implicitly syncs
-            _decode_token_times.append((next_token, _time.time() - _iter_start))
+            _decode_token_times.append((next_token, _time.perf_counter() - _iter_start))
             if _answer_logits_list is not None:
                 _answer_logits_list.append(outputs.logits[0, -1:, :].detach())
-            if next_token == self.eos_token_id:
-                break
             tokens.append(next_token)
 
         if synced_gpus:
             # in FSDP, the number of forward pass need to be the same across devices
             # Forward count: 1 (initial) + n_looped_iters + 1 (remaining) + autoregressive tokens
+            new_token_embed = self.embedding(
+                torch.tensor([next_token], device=input_ids.device)
+            ).view(1, 1, -1)
             while self.gen_forward_cnt < max_new_tokens + n_looped_iters + 2:
                 self.gen_forward_cnt += 1
                 _ = self.base_causallm(
@@ -1663,6 +1688,21 @@ class Lotus(nn.Module):
                     past_key_values=kv_cache,
                     use_cache=True,
                 )
+
+        if input_ids.is_cuda:
+            torch.cuda.synchronize(input_ids.device)
+        _decode_time = _time.perf_counter() - _decode_start
+        self._last_timing = {
+            "query_prefill": self._query_prefill_time,
+            "thought": self._thought_time,
+            "prefill_other": _prefill_other_time,
+            "decode": _decode_time,
+        }
+        self._last_decode_token_times = _decode_token_times
+        if _answer_logits_list is not None and _answer_logits_list:
+            self._last_answer_logits = torch.cat(_answer_logits_list, dim=0)
+        else:
+            self._last_answer_logits = None
 
         if output_embedding:
             # Reconstruct full embeddings if needed
@@ -1672,19 +1712,6 @@ class Lotus(nn.Module):
             full_embeds = torch.cat(all_embeds, dim=1)
             return torch.tensor(tokens).view(1, -1), full_embeds, intermediate_tokens
         else:
-            torch.cuda.synchronize()
-            _decode_time = _time.time() - _decode_start
-            self._last_timing = {
-                "query_prefill": self._query_prefill_time,
-                "thought": self._thought_time,
-                "decode": _decode_time,
-            }
-            self._last_decode_token_times = _decode_token_times
-            # Expose per-token answer logits (eval only) for entropy analysis
-            if _answer_logits_list is not None and _answer_logits_list:
-                self._last_answer_logits = torch.cat(_answer_logits_list, dim=0)  # (n_gen, vocab)
-            else:
-                self._last_answer_logits = None
             if output_intermediate:
                 return torch.tensor(tokens).view(1, -1), intermediate_tokens
             return torch.tensor(tokens).view(1, -1)

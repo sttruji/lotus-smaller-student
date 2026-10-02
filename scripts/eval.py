@@ -1,433 +1,359 @@
-"""
-Standalone evaluation script for LOTUS and CoT models.
-Evaluates on GSM8K, GSM-Hard, MultiArith, SVAMP.
-"""
+"""Standalone evaluation with explicit accuracy and resource accounting."""
 import argparse
-import os
-import sys
 import json
-import math
+import os
+from pathlib import Path
+import sys
 import time
+
 import torch
-import torch.distributed as dist
 from datasets import load_dataset, concatenate_datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
 
-# scripts/ dir on the path for sibling imports; data/ lives at the repo root (its parent).
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
 sys.path.insert(0, _SCRIPT_DIR)
 from lotus import Lotus
+from eval_accounting import (checkpoint_backbone, evaluate_examples,
+                             extract_answer, generation_record)
 
 
-def load_ood_dataset(name):
-    """Load OOD dataset, returns list of (question, answer) tuples."""
+def load_ood_dataset(name, *, svamp_split="all"):
+    """Return the ordered question/answer population evaluated by this run."""
     if name == "gsm-hard":
         ds = load_dataset("reasoning-machines/gsm-hard", split="train")
-        data = []
-        for ex in ds:
-            q = ex["input"].strip()
-            a = str(ex["target"]).strip().replace(",", "")
-            if a.endswith(".0"):
-                a = a[:-2]
-            data.append((q, a))
-        return data
+        data = [(ex["input"], ex["target"]) for ex in ds]
     elif name == "multi-arith":
         ds = load_dataset("ChilleD/MultiArith", split="test")
-        data = []
-        for ex in ds:
-            q = ex["question"].strip()
-            a = str(ex["final_ans"]).strip().replace(",", "")
-            if a.endswith(".0"):
-                a = a[:-2]
-            data.append((q, a))
-        return data
+        data = [(ex["question"], ex["final_ans"]) for ex in ds]
     elif name == "svamp":
         ds = load_dataset("ChilleD/SVAMP")
-        combined = concatenate_datasets([ds["train"], ds["test"]])
-        data = []
-        for ex in combined:
-            q = ex["question_concat"].strip()
-            a = str(ex["Answer"]).strip().replace(",", "")
-            if a.endswith(".0"):
-                a = a[:-2]
-            data.append((q, a))
-        return data
-    elif name == "gsm8k":
-        json_path = os.path.join(_REPO_ROOT, "data", "gsm_test.json")
-        with open(json_path) as f:
-            raw = json.load(f)
-        return [(d["question"].strip(), d["answer"].replace(",", "").strip()) for d in raw]
+        population = (concatenate_datasets([ds["train"], ds["test"]])
+                      if svamp_split == "all" else ds["test"])
+        data = [(ex["question_concat"], ex["Answer"]) for ex in population]
     else:
-        # Try loading from local JSON file
-        with open(name) as f:
-            raw = json.load(f)
-        return [(d["question"], d["answer"].replace(",", "").strip()) for d in raw]
+        path = Path(_REPO_ROOT) / "data/gsm_test.json" if name == "gsm8k" else Path(name)
+        with path.open() as stream:
+            raw = json.load(stream)
+        data = [(ex["question"], ex["answer"]) for ex in raw]
+    return [(str(question).strip(), str(answer).replace(",", "").strip())
+            for question, answer in data]
 
 
-def extract_answer(text):
-    """Extract final answer from model output like '... ### 42'"""
-    import re
-    # Try to find answer after ### first
-    parts = text.split("###")
-    if len(parts) > 1:
-        ans = parts[-1].replace(",", "").strip()
-        if ans:
-            return ans
-    # Fallback: find the last number in the text
-    numbers = re.findall(r'-?[\d,]+\.?\d*', text)
-    if numbers:
-        return numbers[-1].replace(",", "").strip()
-    return text.split("#")[-1].replace(",", "").strip()
+def dataset_source(name, svamp_split):
+    if name == "gsm-hard":
+        return {"dataset": "reasoning-machines/gsm-hard", "split": "train"}
+    if name == "multi-arith":
+        return {"dataset": "ChilleD/MultiArith", "split": "test"}
+    if name == "svamp":
+        return {"dataset": "ChilleD/SVAMP", "split": "train+test" if svamp_split == "all" else "test"}
+    path = Path(_REPO_ROOT) / "data/gsm_test.json" if name == "gsm8k" else Path(name)
+    return {"path": str(path.resolve()), "split": "local_json"}
+
+
+def synchronize(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def phase_times(token_times, marker_ids, *, cot):
+    """Heuristic delimiter timing; the full generation timer is authoritative."""
+    thought = marker = answer = 0.0
+    phase = "thought" if cot else "marker"
+    boundary_ids, all_marker_ids = marker_ids
+    for token_id, elapsed in token_times:
+        if phase == "thought" and token_id in boundary_ids:
+            phase = "marker"
+        if phase == "thought":
+            thought += elapsed
+        elif phase == "marker" and token_id in all_marker_ids:
+            marker += elapsed
+        else:
+            phase = "answer"
+            answer += elapsed
+    return thought, marker, answer
+
+
+def predict_example(model, tokenizer, question, args, special_ids, marker_ids):
+    device = torch.device(args.device)
+    question_ids = tokenizer.encode(question + "\n", add_special_tokens=True)
+    if args.cot:
+        prefix = question_ids
+    else:
+        start_id, end_id, latent_id = special_ids
+        count = (args.n_latent_override if args.n_latent_override is not None
+                 else args.n_looped_iters * args.c_thought)
+        prefix = question_ids + [start_id] + [latent_id] * count + [end_id]
+    input_ids = torch.tensor([prefix], device=device)
+    attention_mask = torch.ones_like(input_ids)
+
+    synchronize(device)
+    inference_start = time.perf_counter()
+    if args.cot:
+        prefill_start = time.perf_counter()
+        output = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
+        synchronize(device)
+        prefill_time = time.perf_counter() - prefill_start
+        cache = output.past_key_values
+        first_start = time.perf_counter()
+        next_token = torch.argmax(output.logits[0, -1]).item()
+        token_times = [(next_token, time.perf_counter() - first_start)]
+        generated_ids = [next_token]
+        del output
+        seq_len = len(prefix)
+        for _ in range(args.max_new_tokens - 1):
+            if next_token == tokenizer.eos_token_id:
+                break
+            token_start = time.perf_counter()
+            output = model(
+                input_ids=torch.tensor([[next_token]], device=device),
+                past_key_values=cache,
+                position_ids=torch.tensor([[seq_len]], device=device),
+                use_cache=True,
+            )
+            cache = output.past_key_values
+            seq_len += 1
+            next_token = torch.argmax(output.logits[0, -1]).item()
+            synchronize(device)
+            token_times.append((next_token, time.perf_counter() - token_start))
+            generated_ids.append(next_token)
+        thought, marker, answer = phase_times(token_times, marker_ids, cot=True)
+        phases = dict(query_prefill_time=prefill_time, thought_time=thought,
+                      prefill_other_time=0.0, eot_marker_time=marker, answer_time=answer)
+    else:
+        output = model.generate(
+            input_ids=input_ids, attention_mask=attention_mask,
+            max_new_tokens=args.max_new_tokens, n_looped_iters=args.n_looped_iters,
+        )
+        generated_ids = output[0, len(prefix):].tolist()
+        timed_ids = [token_id for token_id, _ in model._last_decode_token_times]
+        if generated_ids != timed_ids:
+            raise ValueError("Returned generation and timed token sequence disagree")
+        _, marker, answer = phase_times(model._last_decode_token_times, marker_ids, cot=False)
+        phases = dict(query_prefill_time=model._last_timing["query_prefill"],
+                      thought_time=model._last_timing["thought"],
+                      prefill_other_time=model._last_timing["prefill_other"],
+                      eot_marker_time=marker, answer_time=answer)
+    synchronize(device)
+    inference_time = time.perf_counter() - inference_start
+    record = generation_record(generated_ids, tokenizer.eos_token_id, args.max_new_tokens)
+    record.update(phases)
+    record.update(inference_time=inference_time, input_tokens=len(prefix),
+                  generated_text=tokenizer.decode(generated_ids, skip_special_tokens=True))
+    return record
+
+
+def write_reports(args, metadata, results):
+    run_metadata = dict(metadata)
+    run_metadata["run_status"] = (
+        "failed" if any(not result["valid_for_accuracy"] for result in results.values())
+        else "complete" if len(results) == len(args.datasets) else "in_progress")
+    if args.save_preds:
+        path = Path(args.save_preds)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({name: result["per_example"] for name, result in results.items()},
+                                   indent=2, allow_nan=False) + "\n")
+    if args.save_metrics:
+        path = Path(args.save_metrics)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"metadata": run_metadata, "datasets": results},
+                                   indent=2, allow_nan=False) + "\n")
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", default=None,
-                        help="Path to a checkpoint_final torch state dict. If omitted, weights are taken "
-                             "directly from --model_id (an HF-format model saved with save_pretrained).")
+                        help="Training state dict, or a directory containing model.pt. Loads strictly.")
     parser.add_argument("--model_id", default="meta-llama/Llama-3.2-3B-Instruct")
-    parser.add_argument("--datasets", nargs="+", default=["gsm-hard", "multi-arith", "svamp"],
-                        help="Dataset names to evaluate")
-    parser.add_argument("--n_looped_iters", type=int, default=6, help="Number of latent loops")
-    parser.add_argument("--c_thought", type=int, default=25, help="Number of thought tokens per loop")
+    parser.add_argument("--datasets", nargs="+", default=["gsm-hard", "multi-arith", "svamp"])
+    parser.add_argument("--n_looped_iters", type=int, default=None)
+    parser.add_argument("--c_thought", type=int, default=None)
+    parser.add_argument("--latent_injection_mode", choices=["add", "replace"], default=None)
     parser.add_argument("--n_latent_override", type=int, default=None,
-                        help="If set, use this exact number of latent positions in the input prefix (overrides n_looped_iters*c_thought).")
+                        help="Exact latent-prefix position count; otherwise loops*c_thought.")
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--bf16", action="store_true", default=True)
-    parser.add_argument("--fp32", action="store_true", default=False,
-                        help="Force fp32 inference (overrides --bf16; needed for GPT-2 trained without bf16).")
-    parser.add_argument("--cot", action="store_true", default=False,
-                        help="Evaluate a CoT model (plain causal LM, no latent tokens)")
-    parser.add_argument("--save_preds", default=None,
-                        help="Optional path to dump per-example predictions (JSON).")
-    parser.add_argument("--save_metrics", default=None,
-                        help="Save accuracy, complete inference phase times, peak memory and model metadata (JSON).")
+    parser.add_argument("--fp32", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--cot", dest="cot", action="store_true", default=None)
+    mode.add_argument("--looped", dest="cot", action="store_false")
+    parser.add_argument("--save_preds", default=None)
+    parser.add_argument("--save_metrics", default=None)
+    parser.add_argument("--continue_on_error", action="store_true",
+                        help="Record failures and continue. Failures count as incorrect; exit status remains nonzero.")
+    parser.add_argument("--svamp_split", choices=["all", "test"], default="all",
+                        help="all preserves the inherited train+test population; test selects only the test split.")
+    parser.add_argument("--allow_untrained_latent_tokens", action="store_true",
+                        help="Allow a bare HF baseline to initialize missing latent embeddings; recorded in metadata.")
     args = parser.parse_args()
 
-    device = torch.device(args.device)
-    dtype = torch.float32 if args.fp32 else (torch.bfloat16 if args.bf16 else torch.float32)
+    # Exported architecture settings are defaults; explicit CLI settings are logged overrides.
+    architecture_path = Path(args.model_id) / "lotus_config.json"
+    architecture = json.loads(architecture_path.read_text()) if architecture_path.is_file() else {}
+    args.cot = args.cot if args.cot is not None else architecture.get("cot", False)
+    for field, default in (("n_looped_iters", 6), ("c_thought", 25), ("latent_injection_mode", "add")):
+        if getattr(args, field) is None:
+            setattr(args, field, architecture.get(field, default))
+    if args.max_new_tokens < 1 or args.n_looped_iters < 0 or args.c_thought < 1:
+        parser.error("max_new_tokens and c_thought must be positive; n_looped_iters must be nonnegative")
+    if args.n_latent_override is not None and args.n_latent_override < 0:
+        parser.error("n_latent_override must be nonnegative")
+    if args.latent_injection_mode not in ("add", "replace"):
+        parser.error("Unsupported latent_injection_mode in exported architecture")
+    if len(set(args.datasets)) != len(args.datasets):
+        parser.error("Dataset names must be unique")
 
-    # Load tokenizer and add special tokens
-    print(f"Loading tokenizer from {args.model_id}...")
+    device = torch.device(args.device)
+    dtype = torch.float32 if args.fp32 else torch.bfloat16
+    print(f"Loading tokenizer and base model from {args.model_id}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
     tokenizer.pad_token = tokenizer.eos_token
-
+    if tokenizer.eos_token_id is None:
+        raise ValueError("Evaluation requires an EOS token")
+    special_ids = None
+    added_latent_tokens = 0
     if not args.cot:
-        tokenizer.add_tokens("<|start-latent|>")
-        tokenizer.add_tokens("<|end-latent|>")
-        tokenizer.add_tokens("<|latent|>")
-        start_id = tokenizer.convert_tokens_to_ids("<|start-latent|>")
-        end_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
-        latent_id = tokenizer.convert_tokens_to_ids("<|latent|>")
+        tokens = ("<|start-latent|>", "<|end-latent|>", "<|latent|>")
+        added_latent_tokens = tokenizer.add_tokens(list(tokens))
+        special_ids = tuple(tokenizer.convert_tokens_to_ids(token) for token in tokens)
+        if added_latent_tokens and not args.checkpoint and not args.allow_untrained_latent_tokens:
+            raise ValueError("HF tokenizer has no trained latent tokens. Use a trained checkpoint/export, "
+                             "or --allow_untrained_latent_tokens for an intentional untrained baseline.")
+    base_model, loading_info = AutoModelForCausalLM.from_pretrained(
+        args.model_id, torch_dtype=dtype, output_loading_info=True)
+    hf_loaded_completely = not any(loading_info.get(field) for field in
+                                  ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs"))
+    if not args.checkpoint and not hf_loaded_completely:
+        raise ValueError(f"HF model weights did not load completely: {loading_info}")
 
-    # Load base model
-    print(f"Loading base model {args.model_id}...")
-    base_model = AutoModelForCausalLM.from_pretrained(args.model_id, torch_dtype=dtype)
+    checkpoint_loaded_strictly = False
+    if args.checkpoint:
+        path = Path(args.checkpoint)
+        path = path / "model.pt" if path.is_dir() else path
+        print(f"Loading complete checkpoint from {path}...")
+        backbone = checkpoint_backbone(torch.load(path, map_location="cpu", weights_only=True), cot=args.cot)
+        embedding_keys = [key for key in backbone
+                          if key.endswith(("embed_tokens.weight", "wte.weight"))]
+        if len(embedding_keys) != 1:
+            raise ValueError("Checkpoint must contain exactly one backbone input embedding table")
+        vocabulary = backbone[embedding_keys[0]].shape[0]
+        if vocabulary < len(tokenizer):
+            raise ValueError("Checkpoint embedding table does not cover the evaluation tokenizer")
+        if vocabulary != base_model.get_input_embeddings().num_embeddings:
+            base_model.resize_token_embeddings(vocabulary)
+        base_model.load_state_dict(backbone, strict=True)
+        checkpoint_loaded_strictly = True
+        del backbone
 
-    # If a checkpoint state dict is given, load it; otherwise the weights come
-    # directly from --model_id (e.g. an HF-format model saved with save_pretrained).
-    saved_weights = None
-    if args.checkpoint is not None:
-        ckpt_path = args.checkpoint
-        if os.path.isdir(ckpt_path):
-            model_file = os.path.join(ckpt_path, "model.pt")
-            if os.path.exists(model_file):
-                ckpt_path = model_file
-        print(f"Loading checkpoint from {ckpt_path}...")
-        saved_weights = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        # Projection heads are only used during teacher distillation.
-        saved_weights = {k: v for k, v in saved_weights.items() if not k.startswith("distill_alignment.")}
-
-        # Check vocab size and resize if needed
-        emb_key = None
-        for k in saved_weights.keys():
-            if 'embed_tokens.weight' in k or 'wte.weight' in k:
-                emb_key = k
-                break
-        if emb_key:
-            ckpt_vocab = saved_weights[emb_key].shape[0]
-            model_vocab = base_model.get_input_embeddings().weight.shape[0]
-            if ckpt_vocab != model_vocab:
-                print(f"Resizing model vocab from {model_vocab} to {ckpt_vocab}")
-                base_model.resize_token_embeddings(ckpt_vocab)
-    else:
-        # Weights already live in base_model (loaded from --model_id). Ensure the
-        # embedding matrix covers the latent tokens added to the tokenizer.
-        if not args.cot and base_model.get_input_embeddings().weight.shape[0] < len(tokenizer):
-            base_model.resize_token_embeddings(len(tokenizer))
-        print(f"Using weights directly from {args.model_id} (no separate checkpoint).")
-
+    initialized_latent_tokens = False
+    if base_model.get_input_embeddings().num_embeddings < len(tokenizer):
+        if args.checkpoint or args.cot or not args.allow_untrained_latent_tokens:
+            raise ValueError("Model has no weights for the latent tokens. Use a trained checkpoint/export, "
+                             "or --allow_untrained_latent_tokens for an intentional untrained baseline.")
+        base_model.resize_token_embeddings(len(tokenizer))
+        initialized_latent_tokens = True
     if args.cot:
-        # CoT model: plain causal LM, no Lotus wrapper
-        if saved_weights is not None:
-            info = base_model.load_state_dict(saved_weights, strict=False)
-            if info.missing_keys:
-                print(f"Warning: missing keys: {info.missing_keys}")
-            print(f"<All keys matched successfully>" if not info.unexpected_keys else f"Unexpected: {info.unexpected_keys}")
-        model = base_model.to(device).to(dtype)
+        model = base_model
     else:
-        # Lotus model
-        model = Lotus(
-            base_model,
-            latent_token_id=latent_id,
-            start_latent_id=start_id,
-            end_latent_id=end_id,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-            c_thought=args.c_thought,
-        )
+        start_id, end_id, latent_id = special_ids
+        model = Lotus(base_model, latent_token_id=latent_id, start_latent_id=start_id,
+                      end_latent_id=end_id, eos_token_id=tokenizer.eos_token_id,
+                      pad_token_id=tokenizer.pad_token_id, c_thought=args.c_thought,
+                      latent_injection_mode=args.latent_injection_mode)
+    model.to(device).to(dtype).eval()
 
-        if saved_weights is not None:
-            info = model.load_state_dict(saved_weights, strict=False)
-            if info.missing_keys:
-                real_missing = [k for k in info.missing_keys if not k.startswith("teacher")]
-                if real_missing:
-                    print(f"Warning: missing keys: {real_missing}")
-            print(f"<All keys matched successfully>" if not info.unexpected_keys else f"Unexpected: {info.unexpected_keys}")
-            print("Skipping latent token initialization (using trained embeddings from checkpoint)")
-        model = model.to(device).to(dtype)
-    model.eval()
-
-    # Evaluate each dataset
+    boundary_ids = set(tokenizer.encode("###", add_special_tokens=False))
+    boundary_ids.update(tokenizer.encode("#", add_special_tokens=False))
+    marker_ids = (boundary_ids, boundary_ids | set(tokenizer.encode(" ", add_special_tokens=False)))
+    import transformers
+    metadata = {
+        "schema_version": 2, "model_id": args.model_id, "checkpoint": args.checkpoint,
+        "checkpoint_loaded_strictly": checkpoint_loaded_strictly,
+        "hf_loaded_completely": hf_loaded_completely,
+        "weights_source": "checkpoint" if args.checkpoint else "hf_model",
+        "initialized_latent_tokens": initialized_latent_tokens,
+        "untrained_latent_tokens": bool(initialized_latent_tokens or (added_latent_tokens and not args.checkpoint)),
+        "exported_architecture": architecture,
+        "cot": args.cot, "n_looped_iters": args.n_looped_iters if not args.cot else 0,
+        "c_thought": args.c_thought if not args.cot else None,
+        "n_latent_override": args.n_latent_override,
+        "latent_positions": (0 if args.cot else args.n_latent_override
+                             if args.n_latent_override is not None
+                             else args.n_looped_iters * args.c_thought),
+        "latent_injection_mode": args.latent_injection_mode if not args.cot else None,
+        "max_new_tokens": args.max_new_tokens, "dtype": str(dtype), "device": str(device),
+        "unique_parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        "torch_version": torch.__version__, "transformers_version": transformers.__version__,
+        "batch_size": 1, "warmup_examples": 0, "decoding": "greedy",
+        "continue_on_error": args.continue_on_error, "requested_datasets": args.datasets,
+        "accuracy_policy": "correct/entire dataset; errors count as incorrect; null if incomplete or empty",
+        "answer_extraction": "first number after last ###; otherwise last number; exact Decimal comparison",
+        "resource_average_denominator": "successful examples",
+        "generated_token_policy": "includes EOS consistently in both CoT and LOTUS",
+        "timing_scope": "synchronized full generation call; tokenization, scoring and text decode excluded; no warmup exclusion",
+        "phase_detection": "heuristic token IDs for ###, # and space",
+        "prefill_other_scope": "LOTUS suffix forward and forward bookkeeping outside prefix/latent timers",
+        "memory_scope": "peak allocation/reservation including resident model and generation; selected device; GiB",
+    }
     results = {}
-    total_start_time = time.time()
+    start = time.perf_counter()
+    for dataset in args.datasets:
+        print(f"\nEvaluating {dataset}...")
+        data = load_ood_dataset(dataset, svamp_split=args.svamp_split)
+        print(f"Loaded {len(data)} examples; source={dataset_source(dataset, args.svamp_split)}")
+        synchronize(device)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        with tqdm(total=len(data), desc=dataset) as progress_bar:
+            attempted = correct = 0
 
-    for ds_name in args.datasets:
-        mode_str = "cot" if args.cot else f"n_looped_iters={args.n_looped_iters}"
-        print(f"\n{'='*60}")
-        print(f"Evaluating on {ds_name} with {mode_str}")
-        print(f"{'='*60}")
+            def progress(record):
+                nonlocal attempted, correct
+                attempted += 1
+                correct += int(record["correct"])
+                if record["status"] == "error":
+                    print(f"\nError on {dataset} example {record['idx']}: "
+                          f"{record['error_type']}: {record['error']}", file=sys.stderr)
+                elif record["idx"] < 3:
+                    print(f"\nPred: {record['pred']!r} | GT: {record['answer']!r} "
+                          f"| stop={record['stop_reason']}")
+                progress_bar.update(1)
+                progress_bar.set_description(f"{dataset} attempted_acc={correct/attempted:.3f}")
 
-        data = load_ood_dataset(ds_name)
-        print(f"Loaded {len(data)} examples")
+            with torch.no_grad():
+                result = evaluate_examples(
+                    data, lambda question: predict_example(model, tokenizer, question, args, special_ids, marker_ids),
+                    continue_on_error=args.continue_on_error, progress=progress,
+                )
+        synchronize(device)
+        result["source"] = dataset_source(dataset, args.svamp_split)
+        result["peak_mem_alloc_gb"] = (torch.cuda.max_memory_allocated(device) / 1024**3
+                                       if device.type == "cuda" else None)
+        result["peak_mem_reserved_gb"] = (torch.cuda.max_memory_reserved(device) / 1024**3
+                                          if device.type == "cuda" else None)
+        results[dataset] = result
+        write_reports(args, metadata, results)
+        accuracy = f"{result['accuracy']:.2%}" if result["accuracy"] is not None else "unavailable"
+        print(f"{dataset}: status={result['status']} accuracy={accuracy} "
+              f"correct={result['correct']}/{result['total']} successful={result['successful']} "
+              f"failed={result['failed']} unattempted={result['unattempted']} truncated={result['truncated']}")
+        print(f"  full generation={result['inference_time']:.3f}s; "
+              f"phase sum={result['measured_phase_time']:.3f}s; "
+              f"unattributed={result['unattributed_inference_time']:.3f}s")
+        if not result["valid_for_accuracy"] and not args.continue_on_error:
+            break
 
-        correct = 0
-        total = 0
-        total_gen_tokens = 0
-        total_query_prefill_time = 0.0
-        total_thought_time = 0.0
-        total_eot_marker_time = 0.0
-        total_answer_time = 0.0
-        ds_start_time = time.time()
-        per_example_preds = []
-        # Reset peak memory tracking before this dataset
-        torch.cuda.reset_peak_memory_stats()
-
-        # Token IDs for marker detection
-        hash_triple_id = tokenizer.encode("###", add_special_tokens=False)[0]  # 14711
-        hash_single_id = tokenizer.encode("#", add_special_tokens=False)[0]    # 2
-        space_id = tokenizer.encode(" ", add_special_tokens=False)[-1]         # 220
-        eot_marker_ids = {hash_triple_id, hash_single_id, space_id}
-
-        with torch.no_grad():
-            pbar = tqdm(data, desc=f"{ds_name}")
-            for i, (question, answer) in enumerate(pbar):
-                q_tokens = tokenizer.encode(question + "\n", add_special_tokens=True)
-
-                if args.cot:
-                    # CoT: just the question, no latent tokens
-                    input_ids = torch.tensor([q_tokens], device=device)
-                    attention_mask = torch.ones_like(input_ids)
-                else:
-                    # Lotus: question + latent tokens
-                    if args.n_latent_override is not None:
-                        n_latent_tokens = args.n_latent_override
-                    else:
-                        n_latent_tokens = args.n_looped_iters * args.c_thought
-                    latent_tokens = [start_id] + [latent_id] * n_latent_tokens + [end_id]
-                    input_ids = torch.tensor([q_tokens + latent_tokens], device=device)
-                    attention_mask = torch.ones_like(input_ids)
-
-                try:
-                    if args.cot:
-                        # Token-by-token generation with per-token timing
-                        # Phases: THOUGHT -> EOT_MARKER -> ANSWER
-                        # 1. Query prefill
-                        torch.cuda.synchronize()
-                        t0 = time.time()
-                        prefill_out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
-                        torch.cuda.synchronize()
-                        total_query_prefill_time += time.time() - t0
-
-                        # 2. Decode token by token with per-token timing
-                        kv_cache = prefill_out.past_key_values
-                        next_token = torch.argmax(prefill_out.logits[0, -1]).item()
-                        gen_token_ids = [next_token]
-                        seq_len = input_ids.shape[1]
-                        # Per-token times: (token_id, generation_time)
-                        _first_tok_time = time.time()
-                        token_gen_times = [(_first_tok_time, next_token, 0.0)]  # first token is ~free (argmax)
-
-                        for _ in range(args.max_new_tokens - 1):
-                            if next_token == tokenizer.eos_token_id:
-                                break
-                            _iter_start = time.time()
-                            new_input = torch.tensor([[next_token]], device=device)
-                            out = model(input_ids=new_input, past_key_values=kv_cache,
-                                        position_ids=torch.tensor([[seq_len]], device=device),
-                                        use_cache=True)
-                            kv_cache = out.past_key_values
-                            seq_len += 1
-                            next_token = torch.argmax(out.logits[0, -1]).item()  # .item() implicitly syncs
-                            token_gen_times.append((_iter_start, next_token, time.time() - _iter_start))
-                            gen_token_ids.append(next_token)
-
-                        # Classify tokens into phases: thought -> eot_marker -> answer
-                        # "###" (token 14711) marks the boundary
-                        phase = "thought"
-                        ex_thought_time = 0.0
-                        ex_eot_marker_time = 0.0
-                        ex_answer_time = 0.0
-                        for _, tok_id, gen_time in token_gen_times:
-                            if phase == "thought":
-                                if tok_id == hash_triple_id or tok_id == hash_single_id:
-                                    phase = "eot_marker"
-                                    ex_eot_marker_time += gen_time
-                                else:
-                                    ex_thought_time += gen_time
-                            elif phase == "eot_marker":
-                                if tok_id in eot_marker_ids:
-                                    ex_eot_marker_time += gen_time
-                                else:
-                                    phase = "answer"
-                                    ex_answer_time += gen_time
-                            else:  # answer
-                                ex_answer_time += gen_time
-
-                        total_thought_time += ex_thought_time
-                        total_eot_marker_time += ex_eot_marker_time
-                        total_answer_time += ex_answer_time
-
-                        outputs = torch.tensor([input_ids[0].tolist() + gen_token_ids], device=device)
-                    else:
-                        outputs = model.generate(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            max_new_tokens=args.max_new_tokens,
-                            n_looped_iters=args.n_looped_iters,
-                        )
-                        total_query_prefill_time += model._last_timing["query_prefill"]
-                        total_thought_time += model._last_timing["thought"]
-
-                        # Split decode into eot_marker vs answer using per-token times
-                        decode_token_times = model._last_decode_token_times
-                        past_marker = False
-                        ex_eot_marker_time = 0.0
-                        ex_answer_time = 0.0
-                        for tok_id, gen_time in decode_token_times:
-                            if not past_marker and tok_id in eot_marker_ids:
-                                ex_eot_marker_time += gen_time
-                            else:
-                                past_marker = True
-                                ex_answer_time += gen_time
-                        total_eot_marker_time += ex_eot_marker_time
-                        total_answer_time += ex_answer_time
-
-                    # Only decode the generated portion (after input)
-                    input_len = input_ids.shape[1]
-                    gen_tokens = outputs[0][input_len:]
-                    n_gen = len(gen_tokens)
-                    total_gen_tokens += n_gen
-                    gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
-                    pred = extract_answer(gen_text)
-
-                    if i < 3:
-                        print(f"\nQ: {question[:80]}...")
-                        print(f"Gen: '{gen_text}'")
-                        print(f"Pred: '{pred}' | GT: '{answer}'")
-
-                    # Compare numerically
-                    is_correct = False
-                    try:
-                        pred_num = float(pred)
-                        ans_num = float(answer)
-                        if pred_num == ans_num:
-                            correct += 1
-                            is_correct = True
-                    except (ValueError, ZeroDivisionError):
-                        if pred.strip() == answer.strip():
-                            correct += 1
-                            is_correct = True
-                    per_example_preds.append({
-                        "idx": i,
-                        "question": question,
-                        "pred": pred,
-                        "answer": answer,
-                        "correct": is_correct,
-                    })
-
-                except Exception as e:
-                    if i < 3:
-                        print(f"Error on example {i}: {e}")
-
-                total += 1
-                pbar.set_description(f"{ds_name} acc={correct/total:.3f}")
-
-        ds_elapsed = time.time() - ds_start_time
-        acc = correct / total if total > 0 else 0
-        avg_gen_len = total_gen_tokens / total if total > 0 else 0
-        results[ds_name] = {"accuracy": acc, "correct": correct, "total": total,
-                            "avg_gen_tokens": avg_gen_len, "time": ds_elapsed,
-                            "query_prefill_time": total_query_prefill_time,
-                            "thought_time": total_thought_time,
-                            "eot_marker_time": total_eot_marker_time,
-                            "answer_time": total_answer_time,
-                            "per_example": per_example_preds}
-        print(f"\n{ds_name}: {correct}/{total} = {acc*100:.2f}%")
-        print(f"  avg output length: {avg_gen_len:.1f} tokens")
-        print(f"  time: {ds_elapsed:.1f}s ({ds_elapsed/total:.2f}s/example)")
-        print(f"  query prefill: {total_query_prefill_time:.1f}s ({total_query_prefill_time/total*1000:.1f}ms/example)")
-        print(f"  thought:       {total_thought_time:.1f}s ({total_thought_time/total*1000:.1f}ms/example)")
-        print(f"  eot marker:    {total_eot_marker_time:.1f}s ({total_eot_marker_time/total*1000:.1f}ms/example)")
-        print(f"  answer:        {total_answer_time:.1f}s ({total_answer_time/total*1000:.1f}ms/example)")
-        total_inference = total_query_prefill_time + total_thought_time + total_eot_marker_time + total_answer_time
-        print(f"  total infer:   {total_inference:.1f}s ({total_inference/total*1000:.1f}ms/example)")
-        peak_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
-        peak_mem_reserved_gb = torch.cuda.max_memory_reserved() / (1024**3)
-        results[ds_name]["peak_mem_alloc_gb"] = peak_mem_gb
-        results[ds_name]["peak_mem_reserved_gb"] = peak_mem_reserved_gb
-        print(f"  peak GPU mem:  allocated={peak_mem_gb:.3f} GB, reserved={peak_mem_reserved_gb:.3f} GB")
-
-    total_elapsed = time.time() - total_start_time
-
-    # Summary
-    print(f"\n{'='*60}")
-    mode_str = "cot" if args.cot else f"n_looped_iters={args.n_looped_iters}, c_thought={args.c_thought}"
-    print(f"SUMMARY ({mode_str})")
-    print(f"{'='*60}")
-    for ds_name, res in results.items():
-        total_infer = res['query_prefill_time'] + res['thought_time'] + res['eot_marker_time'] + res['answer_time']
-        print(f"  {ds_name:15s}: {res['correct']:4d}/{res['total']:4d} = {res['accuracy']*100:.2f}%  "
-              f"avg_len={res['avg_gen_tokens']:.1f}  "
-              f"q_prefill={res['query_prefill_time']:.1f}s  thought={res['thought_time']:.1f}s  "
-              f"eot_marker={res['eot_marker_time']:.1f}s  answer={res['answer_time']:.1f}s  "
-              f"total={total_infer:.1f}s")
-    print(f"  {'total time':15s}: {total_elapsed:.1f}s")
-
-    if args.save_preds:
-        # Dump per-example predictions across all datasets
-        dump = {ds: res.get("per_example", []) for ds, res in results.items()}
-        with open(args.save_preds, "w") as f:
-            json.dump(dump, f)
-        print(f"Saved per-example predictions to {args.save_preds}")
-
-    if args.save_metrics:
-        import transformers
-        metadata = {"model_id": args.model_id, "checkpoint": args.checkpoint,
-                    "cot": args.cot, "n_looped_iters": args.n_looped_iters,
-                    "c_thought": args.c_thought, "max_new_tokens": args.max_new_tokens,
-                    "dtype": str(dtype), "unique_parameters": sum(p.numel() for p in model.parameters()),
-                    "gpu": torch.cuda.get_device_name(device),
-                    "torch_version": torch.__version__, "transformers_version": transformers.__version__,
-                    "batch_size": 1,
-                    "timing_scope": "query prefill + all reasoning + answer delimiter + answer decoding; no warmup exclusion"}
-        with open(args.save_metrics, "w") as f:
-            json.dump({"metadata": metadata, "datasets": results}, f, indent=2)
-        print(f"Saved accuracy/resource metrics to {args.save_metrics}")
+    metadata["total_elapsed"] = time.perf_counter() - start
+    write_reports(args, metadata, results)
+    for path in (args.save_preds, args.save_metrics):
+        if path:
+            print(f"Saved {path}")
+    return int(len(results) != len(args.datasets)
+               or any(not result["valid_for_accuracy"] for result in results.values()))
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

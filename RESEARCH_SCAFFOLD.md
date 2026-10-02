@@ -245,7 +245,7 @@ test JSON, with greedy decoding and the same output-token cap:
 
 ```bash
 python scripts/eval.py --model_id ./outputs/student-inference --datasets gsm8k \
-  --n_looped_iters 6 --c_thought 25 --max_new_tokens 512 \
+  --max_new_tokens 512 --save_preds ./outputs/student-predictions.json \
   --save_metrics ./outputs/student-metrics.json
 python scripts/eval.py --model_id meta-llama/Llama-3.2-1B-Instruct \
   --checkpoint ./outputs/gsm-cot-sft-student-1b-seed0/checkpoint_final \
@@ -255,14 +255,47 @@ python scripts/eval.py --model_id meta-llama/Llama-3.2-3B-Instruct \
   --datasets gsm8k --cot --max_new_tokens 512 --save_metrics ./outputs/cot-3b-metrics.json
 ```
 
-Current evaluation measures single-example accuracy, generated token count,
-prefill/reasoning/delimiter/answer times and peak GPU allocation/reservation.
-Use the sum of all inference phases for the CoT comparison, not answer decoding
-alone. These are initial measurements: there is no warmup exclusion, latency
-distribution, batched throughput test or FLOP accounting yet. Check truncation
-rates and revisit the cap if full CoT traces regularly hit it. Latent-position and
-loop-count sweeps should be reported with their actual settings; training only
-one setting does not establish robustness to other loop counts.
+Local HF exports supply their mode, loop count, block width and latent injection
+mode through `lotus_config.json`. Explicit CLI settings override those defaults
+and are recorded with the exported settings. Training checkpoint loads require a
+complete backbone with `strict=True`; known projection/auxiliary heads are omitted
+and the shared embedding alias is checked. Incomplete HF exports are rejected too.
+Missing latent embeddings are rejected unless `--allow_untrained_latent_tokens`
+explicitly requests an untrained baseline; that initialization is recorded.
+
+Metrics use schema version 2. Each attempted example has a prediction or error
+record, generated text/token IDs, EOS/token-limit status, and timings. Generation
+stops at the first EOS, and generated-token counts include EOS for both model
+paths. `truncated` means the token cap was reached without EOS; EOS exactly at the
+cap is counted as normal termination. Accuracy uses exact decimal comparison
+after numeric answer extraction. A trailing explanation after `### 42` no longer
+makes that answer incorrect; the generated text is retained for scoring audits.
+
+Errors stop the run by default after saving any requested reports. Use
+`--continue_on_error` to finish the population and record all failures. In either
+mode, any errors produce a nonzero exit status and `valid_for_accuracy=false`.
+The primary denominator is the entire dataset; failed attempts count as incorrect
+when the population is completed. Incomplete and empty datasets have null
+accuracy. Successful-only accuracy is a labeled diagnostic. Token and timing
+averages use successful examples, with failed and unattempted counts reported
+separately. An ordered question/answer SHA-256 and the actual dataset split are
+saved. SVAMP defaults to the inherited train+test population; use
+`--svamp_split test` for its test split alone.
+
+Use `inference_time` for comparisons: it times the synchronized full generation
+call, including prefix, loops, suffix forward and decoding, with tokenization,
+text decoding and scoring excluded. Phase totals remain diagnostic; the
+`prefill_other_time` bucket includes the previously omitted LOTUS suffix forward
+and forward bookkeeping, and `unattributed_inference_time` reports residual time
+outside those phase timers. Delimiter detection is a token-ID heuristic. Peak GPU
+allocation/reservation and synchronization target the selected device; memory is
+reported in GiB and includes the resident model. CPU runs report null GPU memory.
+
+There is no warmup exclusion, latency distribution, batched throughput test or
+FLOP accounting yet. Check truncation rates and revisit the cap if full CoT traces
+regularly hit it. Latent-position and loop-count sweeps should be reported with
+their actual settings; training only one setting does not establish robustness
+to other loop counts. CUDA memory/latency and real-model accuracy need a GPU pilot.
 
 ## Validation in this branch
 
