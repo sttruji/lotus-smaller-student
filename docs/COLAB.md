@@ -11,7 +11,7 @@ survive a new runtime.
 | --- | --- |
 | 1 | Set the dedicated Drive path, run ID and batch profile; clone the public repository |
 | 2 | Install CUDA PyTorch and dependencies into an isolated, ephemeral virtualenv |
-| 3 | Mount Drive, read HF_TOKEN securely, restore an existing run's code/packages, configure paths |
+| 3 | Mount Drive, refresh HF_TOKEN, check model access, restore an existing run's code/packages, configure paths |
 | 4 | Download and verify the original augmented GSM8K splits into Drive once |
 | 5 | Train, or automatically resume the latest verified completed epoch |
 | 6 | Export the completed student and evaluate it alongside optional published CoT baselines |
@@ -28,9 +28,12 @@ cell 5 does not download it again. Re-run cell 4 only to prepare or repair data.
   A100 40/80 GB runtimes meet the GPU gate. T4 and 24 GiB L4 runtimes do not.
   These are planning gates; the full training recipe has not been profiled on Colab.
 - Add a read-only **HF_TOKEN** in Colab Secrets and grant the notebook access.
-  The account must have accepted the access conditions for Llama 3.2 1B and 3B.
-  Cell 3 offers a hidden prompt if a secret is unavailable. Tokens are inherited
-  by subprocesses and are never serialized in the run plan or saved to Drive.
+  The token's account must have approved access to Llama 3.2 1B and 3B Instruct.
+  Fine-grained tokens also need read permission for those gated repositories.
+  Cell 3 reads the Secret again on each execution and offers a hidden prompt
+  when no Secret or environment token exists. A Secret with notebook access
+  disabled produces an explicit error. Tokens are inherited by subprocesses
+  and are never serialized in the run plan or saved to Drive.
 - Choose your own dedicated **DRIVE_ROOT** inside mounted MyDrive. Allow
   approximately 60 GiB free for Hub caches, two full epoch snapshots, two best
   generations, an inference export and temporary writes. Interrupted/quarantined
@@ -53,9 +56,10 @@ a new run ID for the actual experiment.
 The isolated environment uses official PyTorch 2.7.1 CUDA 12.6 wheels plus
 [requirements-colab.txt](../requirements-colab.txt). It leaves the notebook
 kernel's installed packages intact and needs no kernel restart. The first run
-records a package freeze and Python major/minor version. Cell 3 restores that
-freeze and the recorded Git commit before resuming. A different Python version
-requires selecting a compatible runtime. CUDA driver and GPU differences can
+records a package freeze and Python major/minor version after model preflight
+succeeds. Cell 3 restores that freeze and the recorded Git commit before resuming.
+A different Python version requires selecting a compatible runtime.
+CUDA driver and GPU differences can
 still affect numerical reproducibility.
 
 ## Persistent layout
@@ -167,6 +171,47 @@ Re-run cell 2, then continue with cell 3. No manual deletion of the partial
 environment is needed. This bootstrap relies on the notebook interpreter having
 pip 22.3 or newer, which introduced `--python`.
 
+## Recovering from a cell-5 Hugging Face 403
+
+A reported run passed the hardware gate on an A100 80 GB with 167 GiB host RAM,
+then failed before training when preflight tried to download the pinned
+`meta-llama/Llama-3.2-1B-Instruct/config.json`. This is an account/token access
+failure. It does not establish the training recipe's peak memory usage.
+
+1. Log into the Hugging Face account that owns the token. Open both
+   [Llama 3.2 1B Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct)
+   and [Llama 3.2 3B Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct).
+   Accept the required conditions/request access and wait until access is approved.
+2. Use a read token from that account. If it is fine-grained, grant read access
+   to the gated repositories. Update **HF_TOKEN** in Colab Secrets and enable
+   notebook access. See Hugging Face's [gated-model guide](https://huggingface.co/docs/hub/models-gated)
+   and [token permissions](https://huggingface.co/docs/hub/security-tokens).
+3. Rerun cell 3, then cell 5 with the same Drive path and run ID.
+
+The original cell 3 preferred an existing environment token over an updated
+Secret. Saved notebook copies retain that old behavior unless their cell is
+replaced. For an existing copy, refresh the environment explicitly in a temporary
+cell, then rerun cells 3 and 5:
+
+~~~python
+from google.colab import userdata
+import os
+os.environ["HF_TOKEN"] = userdata.get("HF_TOKEN").strip()
+~~~
+
+The updated cell 3 displays the authenticated username, checks repository access
+and fetches each model's small `config.json` without downloading weights. It checks
+the base 1B/3B repositories and the published LOTUS CoT 1B/3B repositories; seeing
+public model metadata alone does not establish access to gated files. The checker
+uses the isolated environment and is copied under `/content` before restoring an
+older recorded commit, so repeated cell-3 execution can still check access.
+
+Fetching new code with cell 1 does not replace the cells in your saved notebook.
+Copy the updated cell 3 or reopen the current repository notebook to get these
+checks. Existing run plans retain their recorded training code and settings.
+Fixing credentials allows the reported failed run to continue without changing
+its initialization, dataset, run ID or checkpoint selection.
+
 ## Evaluation and comparison
 
 Cell 6 requires all planned training epochs and a verified fully latent best
@@ -198,11 +243,14 @@ See [EVALUATION.md](EVALUATION.md) for accounting details.
 ## Validation status
 
 The notebook is delivered without saved outputs or credentials. Its JSON structure,
-cell order and Python syntax are reviewed locally. No school-account, Drive-mount,
-CUDA training, Colab dependency installation or end-to-end resume run has been
-performed. The earlier 54 CPU tests predate this notebook and do not validate the
-new persistence protocol. GPU and Drive behavior still need an actual pilot.
+cell order and Python syntax are reviewed locally. User reports cover dependency
+setup and reaching model preflight on an A100 80 GB; training then stopped on a
+gated-model access error. Local validation has not included Colab execution, CUDA
+training or end-to-end resume. The earlier 54 CPU tests predate this notebook and
+do not validate the new persistence protocol. GPU and Drive behavior still need
+an actual pilot.
 
 Relevant implementation: [colab_runner.py](../scripts/colab_runner.py),
+[hub_access.py](../scripts/hub_access.py),
 [persistent_checkpoints.py](../scripts/persistent_checkpoints.py), [run.py](../scripts/run.py),
 and [dataset.py](../scripts/dataset.py).

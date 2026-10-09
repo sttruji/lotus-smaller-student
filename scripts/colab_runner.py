@@ -229,7 +229,10 @@ def recipe(session, run, data_dir):
 
 def pin_models(config):
     from huggingface_hub import HfApi
-    api = HfApi()
+    from hub_access import check_hub_access
+    check_hub_access(config[key] for key in
+                     ("model_id", "load_model_path", "teacher_model_path", "teacher_tokenizer_id"))
+    api = HfApi(token=os.environ["HF_TOKEN"])
     revisions = {}
     for key in ("model_id", "load_model_path", "teacher_model_path", "teacher_tokenizer_id"):
         repo_id = config[key]
@@ -253,6 +256,7 @@ def train(session_file):
                     "python": list(sys.version_info[:2]), "packages": environment()}
         run.mkdir(parents=True, exist_ok=True)
         plan_path = run / "run_plan.json"
+        new_plan = not plan_path.exists()
         if plan_path.exists():
             plan = json.loads(plan_path.read_text())
             if identity != plan["identity"]:
@@ -263,10 +267,8 @@ def train(session_file):
             hardware(training=True)
             revisions = pin_models(config)
             freeze = subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True)
-            (run / "requirements.freeze.txt").write_text(freeze)
             plan = {"schema_version": 1, "identity": identity, "training_config": config,
                     "model_revisions": revisions, "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-            atomic_json(plan_path, plan)
         checkpoints = completed_epochs(run)
         existing = list(run.glob("checkpoint_*"))
         had_completed_work = (any((path / "COMPLETED.json").exists() for path in existing)
@@ -297,6 +299,10 @@ def train(session_file):
         print(f"Batch {config['batch_size_training']}/{config['gradient_accumulation_steps']} = 128; target {config['num_epochs']} epochs")
         print(f"Persistent run: {run}\nKeep at least 60 GiB free in Drive for caches, snapshots, best weights and exports.", flush=True)
         execute([sys.executable, "scripts/preflight_distillation.py", str(session_config), "--check-models"], run / "logs/preflight.log")
+        if new_plan:
+            # Do not lock a new run to a code/environment plan that failed preflight.
+            (run / "requirements.freeze.txt").write_text(freeze)
+            atomic_json(plan_path, plan)
         stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
         execute([sys.executable, "-m", "torch.distributed.run", "--standalone", "--nnodes=1", "--nproc_per_node=1",
                  "scripts/run.py", str(session_config)], run / f"logs/train-{stamp}.log")

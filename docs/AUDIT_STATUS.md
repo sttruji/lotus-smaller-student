@@ -44,6 +44,14 @@ bootstraps it using the notebook interpreter's `pip --python`, including when a
 failed attempt has already left `bin/python` behind. Recovery instructions are
 in the [Colab guide](COLAB.md#recovering-from-a-cell-2-ensurepip-failure).
 
+A subsequent user run passed the hardware gate on an A100 80 GB with 167 GiB
+host RAM, then received a Hugging Face 403 for the base 1B model during preflight.
+Training had not started. Cell 3 now refreshes the Colab Secret instead of keeping
+a stale environment token and checks the authenticated account plus model-file
+access. New run plans are saved after successful preflight. This hardware report
+does not establish training memory usage or throughput. Recovery steps are in the
+[Colab guide](COLAB.md#recovering-from-a-cell-5-hugging-face-403).
+
 These changes have only received notebook-structure/Python-syntax/source review.
 No new runtime tests or GPU/Drive training run were performed. The 54-test record
 below predates the Colab changes and does not validate the new checkpoint protocol.
