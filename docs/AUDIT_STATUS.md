@@ -38,6 +38,12 @@ optimizer learning rates. Resume now reapplies the scheduler's saved learning
 rates before the next update. Local checkpoint weights are loaded onto CPU
 before model placement, avoiding a redundant GPU-resident copy during resume.
 
+A reported Python 3.13 Colab startup failure occurred inside `ensurepip`, before
+dependency installation. Cell 2 now creates the environment without pip and
+bootstraps it using the notebook interpreter's `pip --python`, including when a
+failed attempt has already left `bin/python` behind. Recovery instructions are
+in the [Colab guide](COLAB.md#recovering-from-a-cell-2-ensurepip-failure).
+
 These changes have only received notebook-structure/Python-syntax/source review.
 No new runtime tests or GPU/Drive training run were performed. The 54-test record
 below predates the Colab changes and does not validate the new checkpoint protocol.

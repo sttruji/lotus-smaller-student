@@ -141,6 +141,32 @@ and checksums establish the mounted filesystem's contents, not a cloud durabilit
 acknowledgment. Google also documents runtime variability and Drive I/O limits.
 See the [Colab FAQ](https://research.google.com/colaboratory/faq.html).
 
+## Recovering from a cell-2 ensurepip failure
+
+A user reported that the original `venv.EnvBuilder(with_pip=True)` failed in
+Colab's Python 3.13 `ensurepip` step, before dependency installation. That attempt
+can leave `bin/python` behind without a working pip. Checking only whether the
+Python executable exists is insufficient for retrying setup.
+
+Cell 2 now creates/reuses the environment with `with_pip=False, clear=False`,
+then uses the notebook interpreter's pip with `--python` to install pip into the
+target environment. This avoids `ensurepip` and completes the partial environment.
+See [pip's documented support for pip-free environments](https://pip.pypa.io/en/stable/topics/python-option/).
+
+A saved notebook copy does not update its cells when cell 1 fetches new repo code.
+For an existing copy, replace the original `if not PYTHON.is_file()` block and the
+following pip-upgrade command in cell 2 with:
+
+~~~python
+venv.EnvBuilder(with_pip=False, clear=False).create(VENV_DIR)
+subprocess.run([sys.executable, "-m", "pip", "--python", str(PYTHON),
+                "install", "--upgrade", "pip"], check=True)
+~~~
+
+Re-run cell 2, then continue with cell 3. No manual deletion of the partial
+environment is needed. This bootstrap relies on the notebook interpreter having
+pip 22.3 or newer, which introduced `--python`.
+
 ## Evaluation and comparison
 
 Cell 6 requires all planned training epochs and a verified fully latent best
