@@ -1,6 +1,6 @@
 # Audit and validation status
 
-Updated 2026-10-02. The initial review covered scaffold commit
+Updated 2026-10-09. The initial review covered scaffold commit
 6f58ae74999c83a359ca99a94b7f8bfd65b097d5, based on LOTUS upstream commit
 eb77e2f7909c5006f58ff0ad7cd6629b942caa9e. The implementation fixes below
 are published on main.
@@ -22,6 +22,25 @@ Earlier scaffold fixes cover out-of-place recurrent embedding updates,
 cache-free activation-checkpointed decoder calls and objective-preserving suffix
 recomputation. Final checkpoint selection begins only at the fully latent stage
 for the main research configuration.
+
+## Colab persistence work (GPU validation pending)
+
+The [seven-cell Colab notebook](COLAB.md) adds an optional single-GPU checkpoint
+protocol with completion markers, checksummed artifacts, two retained epoch
+snapshots and two best-model generations. Resume restores optimizer/scheduler/RNG
+and curriculum state; incompatible run settings fail instead of starting over.
+The helper pins model revisions, Git commit and dependencies and caches completed
+evaluations. Dataset preprocessing uses two processes on this path to reduce
+host RAM pressure; normal training retains its existing process default.
+
+Source review also found that LambdaLR construction could change restored
+optimizer learning rates. Resume now reapplies the scheduler's saved learning
+rates before the next update. Local checkpoint weights are loaded onto CPU
+before model placement, avoiding a redundant GPU-resident copy during resume.
+
+These changes have only received notebook-structure/Python-syntax/source review.
+No new runtime tests or GPU/Drive training run were performed. The 54-test record
+below predates the Colab changes and does not validate the new checkpoint protocol.
 
 ## Existing CPU evidence
 

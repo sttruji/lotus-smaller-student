@@ -10,6 +10,7 @@ import os
 import random
 import sys
 from copy import copy
+from pathlib import Path
 
 import numpy as np
 import shutil
@@ -48,6 +49,8 @@ from run_metadata import write_run_manifest
 from preflight_distillation import validate_configuration
 from inference_model import build_inference_model
 from selection_state import restore_best_accuracy, update_checkpoint_best_accuracy
+from persistent_checkpoints import (atomic_json, best_checkpoint, completed_epochs,
+                           prune_best, prune_epochs, validate_bundle, write_bundle)
 
 
 def main():
@@ -68,6 +71,9 @@ def main():
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
+    transactional = bool(config_dict.get("transactional_checkpoints", False))
+    if transactional and world_size != 1:
+        raise ValueError("Transactional Colab checkpoints currently require exactly one GPU")
 
     # Apply CLI overrides
     if args.name is not None:
@@ -85,6 +91,12 @@ def main():
 
     torch.distributed.barrier()
     cur_ckpts = os.listdir(save_dir)
+
+    if transactional and configs.resume:
+        candidate = Path(configs.load_model_path) if configs.load_model_path not in (None, "None") else Path(save_dir) / f"checkpoint_{configs.resume}"
+        record = validate_bundle(candidate, expected_kind="epoch")
+        if record["epoch"] != configs.resume:
+            raise ValueError("Requested resume epoch disagrees with completed checkpoint")
 
     # check if the job is preempted and resumed.
 
@@ -122,7 +134,8 @@ def main():
         # and resume was NOT explicitly set (resume == 0), then auto-resume from latest checkpoint.
         # This handles preemption recovery.
 
-        checkpoints = [f for f in cur_ckpts if f.startswith("checkpoint_") and f.split("_")[1].isdigit()]
+        checkpoints = ([path.name for _, path in completed_epochs(save_dir)] if transactional else
+                       [f for f in cur_ckpts if f.startswith("checkpoint_") and f.split("_")[1].isdigit()])
         checkpoints.sort(key=lambda x: int(x.split("_")[1]))
 
         if checkpoints:
@@ -180,7 +193,7 @@ def main():
                 if os.path.exists(model_file):
                     model_load_path = model_file
             saved_weights = torch.load(
-                model_load_path, map_location=torch.device(rank), weights_only=False
+                model_load_path, map_location="cpu", weights_only=False
             )
 
         # Check if checkpoint has larger vocab (includes latent tokens)
@@ -444,12 +457,14 @@ def main():
     cot_val = ["\n".join(d["steps"]) for d in val_rows]
 
     base_dataset_valid = get_dataset(
-        configs.val_path, tokenizer, max_size=val_limit
+        configs.val_path, tokenizer, max_size=val_limit,
+        num_proc=getattr(configs, "dataset_num_proc", 32),
     )
 
     if not configs.only_eval:
         base_dataset_train = get_dataset(
-            configs.train_path, tokenizer, max_size=train_limit
+            configs.train_path, tokenizer, max_size=train_limit,
+            num_proc=getattr(configs, "dataset_num_proc", 32),
         )
 
         # Automatically set c_thought to max CoT step length if auto_c_thought is enabled
@@ -561,6 +576,46 @@ def main():
         if rank == 0 and restored_best > best_acc:
             print(f"Recovered best val acc from final checkpoint metadata: {restored_best}")
         best_acc = restored_best
+        if transactional:
+            best = best_checkpoint(save_dir)
+            if best is not None:
+                # Available, verified weights establish the recoverable score;
+                # a higher score in periodic state can refer to a corrupt best.
+                best_acc = best[1]["val_accuracy"]
+            elif best_acc >= 0:
+                raise RuntimeError("All selected best-model generations are missing/corrupt; restore a backup before resuming")
+
+    def save_completed_epoch(epoch, scheduled_stage, val_accuracy=None):
+        """Colab protocol: publish only after training and validation finish."""
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        optim_policy = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(parallel_model, StateDictType.FULL_STATE_DICT, save_policy, optim_policy):
+            model_state = parallel_model.state_dict()
+            optimizer_state = FSDP.optim_state_dict(parallel_model, optimizer)
+        if rank == 0:
+            state = {
+                "epoch": epoch + 1, "total_train_steps": total_train_steps,
+                "best_acc": best_acc,
+                "lr_scheduler": lr_scheduler.state_dict() if lr_scheduler else None,
+                "rng_state": {"python": random.getstate(), "numpy": np.random.get_state(),
+                              "torch": torch.random.get_rng_state(), "cuda": torch.cuda.get_rng_state()},
+            }
+            destination = write_bundle(
+                os.path.join(save_dir, f"checkpoint_{epoch + 1}"),
+                {"model.pt": model_state, "optimizer.pt": optimizer_state, "training_state.pt": state},
+                kind="epoch", epoch=epoch + 1,
+            )
+            atomic_json(Path(save_dir) / "history" / f"epoch_{epoch + 1}.json", {
+                "epoch": epoch + 1, "scheduled_stage": scheduled_stage,
+                "val_accuracy": val_accuracy, "best_acc": best_acc,
+                "total_train_steps": total_train_steps, "checkpoint": str(destination),
+            })
+            prune_epochs(save_dir, int(getattr(configs, "checkpoint_keep_last", 2)))
+            print(f"Completed checkpoint: {destination}", flush=True)
+        dist.barrier()
+        del model_state, optimizer_state
+        gc.collect()
+        torch.cuda.empty_cache()
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
 
@@ -718,6 +773,10 @@ def main():
                     training_state = torch.load(training_state_path, map_location="cpu", weights_only=False)
                     if training_state.get("lr_scheduler") is not None:
                         lr_scheduler.load_state_dict(training_state["lr_scheduler"])
+                        # LambdaLR construction changes optimizer LRs before its
+                        # state is restored; restore those too before the next step.
+                        for group, saved_lr in zip(optimizer.param_groups, lr_scheduler.get_last_lr()):
+                            group["lr"] = saved_lr
                         if rank == 0:
                             print(f"Restored LR scheduler state (last_epoch={lr_scheduler.last_epoch})")
                     del training_state
@@ -929,7 +988,7 @@ def main():
             # Save periodic checkpoint (model + optimizer + scheduler + RNG states)
             ckpt_dir = None
             save_every = getattr(configs, "save_every_epochs", 1)
-            if not configs.debug and (epoch + 1) % save_every == 0:
+            if not transactional and not configs.debug and (epoch + 1) % save_every == 0:
                 ckpt_dir = os.path.join(save_dir, f"checkpoint_{epoch + 1}")
                 if rank == 0:
                     os.makedirs(ckpt_dir, exist_ok=True)
@@ -987,6 +1046,8 @@ def main():
             )
 
             if skip_eval:
+                if transactional and not configs.debug:
+                    save_completed_epoch(epoch, scheduled_stage)
                 # Skip eval this epoch — just flush logs and continue
                 if wandb_run and rank == 0:
                     wandb_run.log({}, commit=True)
@@ -1196,14 +1257,23 @@ def main():
                 with FSDP.state_dict_type(parallel_model, StateDictType.FULL_STATE_DICT, save_policy):
                     states = parallel_model.state_dict()
                     if rank == 0:
-                        final_ckpt_path = os.path.join(save_dir, "checkpoint_final")
-                        torch.save(states, final_ckpt_path)
-                        with open(os.path.join(save_dir, "checkpoint_final_metadata.json"), "w") as f:
-                            json.dump({"epoch": epoch + 1, "scheduled_stage": scheduled_stage,
+                        metadata = {"epoch": epoch + 1, "scheduled_stage": scheduled_stage,
                                        "c_thought": configs.c_thought, "val_accuracy": val_acc,
                                        "all_cot_removed": bool(getattr(configs, "replace_all_cot_at_max_stage", False)
-                                                               and scheduled_stage >= configs.max_latent_stage)}, f, indent=2)
-                        print(f"New best val acc: {val_acc:.4f} — saved checkpoint_final")
+                                                               and scheduled_stage >= configs.max_latent_stage)}
+                        if transactional:
+                            import uuid
+                            destination = Path(save_dir) / "best_checkpoints" / f"epoch_{epoch + 1}_{uuid.uuid4().hex}"
+                            write_bundle(destination, {"model.pt": states, "metadata.json": metadata},
+                                         kind="best", epoch=epoch + 1)
+                            prune_best(save_dir)
+                            print(f"New best val acc: {val_acc:.4f} — saved {destination}")
+                        else:
+                            final_ckpt_path = os.path.join(save_dir, "checkpoint_final")
+                            torch.save(states, final_ckpt_path)
+                            with open(os.path.join(save_dir, "checkpoint_final_metadata.json"), "w") as f:
+                                json.dump(metadata, f, indent=2)
+                            print(f"New best val acc: {val_acc:.4f} — saved checkpoint_final")
                 dist.barrier()
                 del states
                 gc.collect()
@@ -1212,11 +1282,13 @@ def main():
         if configs.only_eval:
             break
 
-        # The periodic snapshot is saved before validation for preemption recovery.
+        # Legacy periodic snapshots are saved before validation for recovery.
         # Persist this epoch's final selection score after validation completes.
         # Resume also reconciles final metadata if interrupted between these writes.
         if rank == 0 and ckpt_dir is not None:
             update_checkpoint_best_accuracy(ckpt_dir, best_acc)
+        if transactional and not configs.debug:
+            save_completed_epoch(epoch, scheduled_stage, cor / total)
 
         # Flush all commit=False logs for this epoch
         if wandb_run and rank == 0:
@@ -1226,11 +1298,12 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
-    # checkpoint_final is saved during training when val acc improves (best model selection)
+    # Best artifacts are saved during training when validation accuracy improves.
     if rank == 0 and not configs.only_eval and not configs.debug:
-        final_path = os.path.join(save_dir, "checkpoint_final")
+        final_path = (os.path.join(save_dir, "best_checkpoints") if transactional else
+                      os.path.join(save_dir, "checkpoint_final"))
         if os.path.exists(final_path):
-            print(f"Best val acc: {best_acc:.4f} — checkpoint_final already saved")
+            print(f"Best val acc: {best_acc:.4f} — best artifact saved at {final_path}")
         else:
             print(f"Warning: no checkpoint_final saved (val acc never improved from {best_acc})")
 

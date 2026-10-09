@@ -18,6 +18,7 @@ evaluation fixes.
 
 | Guide | Contents |
 | --- | --- |
+| [Colab notebook](docs/COLAB.md) | Seven-cell workflow, persistent Drive data/checkpoints, automatic resume, evaluation and baseline plots |
 | [Research scaffold](RESEARCH_SCAFFOLD.md) | Architecture, objectives, environment, controlled baselines, training, resume and export |
 | [Training batches](docs/TRAINING_BATCHES.md) | Recorded 2/64 and 8/16 options, effective batch 128, paper settings and accumulation behavior |
 | [A100 planning](docs/A100_PLANNING.md) | Data counts, runtime assumptions, training memory estimates and GPU profiling work |
@@ -45,6 +46,19 @@ The published initialization is convenient for a pilot. A controlled study first
 trains the 1B and 3B CoT baselines on the same prepared splits and then uses those
 exact checkpoints for all distillation comparisons. See
 [controlled training](RESEARCH_SCAFFOLD.md#train-the-controlled-baselines-then-distill).
+
+## Run on Google Colab
+
+[Open the seven-cell notebook in Colab](https://colab.research.google.com/github/sttruji/lotus-smaller-student/blob/main/notebooks/colab_training.ipynb).
+Save a copy to your school Drive and edit its dedicated Drive path and run ID.
+First session: cells **1, 2, 3, 4, 5**; subsequent sessions: **1, 2, 3, 5**.
+Cells **6 and 7** evaluate completed training and plot comparisons against the
+published CoT 1B/3B reference checkpoints.
+
+The default is 2/64, effective batch 128. The notebook requires a high-RAM runtime
+and a BF16 GPU with at least 35 GiB VRAM. Checkpoints recover completed epochs;
+an interrupted epoch repeats. Full Colab/Drive/GPU validation is still pending.
+See [the Colab guide](docs/COLAB.md) for persistence, storage and session limits.
 
 ## Setup on a CUDA node
 

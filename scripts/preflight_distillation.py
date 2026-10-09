@@ -6,6 +6,13 @@ from configuration import apply_overrides, load_hierarchical_yaml
 
 
 def validate_configuration(config):
+    if config.get("transactional_checkpoints"):
+        if config.get("debug") or config.get("reset_optimizer") or config.get("only_eval"):
+            raise ValueError("Transactional checkpoints require debug=false, reset_optimizer=false and training mode")
+        if config.get("save_every_epochs", 1) != 1 or config.get("checkpoint_keep_last", 2) < 2:
+            raise ValueError("Transactional checkpoints require saving every epoch and retaining at least two")
+        if config.get("dataset_num_proc", 2) < 1:
+            raise ValueError("dataset_num_proc must be positive")
     for key in ("train_max_examples", "val_max_examples"):
         value = config.get(key)
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):

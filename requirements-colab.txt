@@ -1,0 +1,11 @@
+# Installed into an isolated /content virtualenv by the notebook.
+# CUDA PyTorch is installed separately from its official cu126 wheel index.
+-r requirements.txt
+huggingface_hub==0.26.5
+accelerate==1.1.1
+PyYAML==6.0.2
+numpy==2.2.6
+matplotlib==3.10.3
+pandas==2.2.3
+pyarrow==19.0.1
+safetensors==0.5.3

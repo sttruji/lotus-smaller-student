@@ -1,7 +1,7 @@
 # Smaller recurrent student: research and compute-node guide
 
 Repository: [sttruji/lotus-smaller-student](https://github.com/sttruji/lotus-smaller-student).
-Current branch: `main`. Documentation updated 2026-10-02.
+Current branch: `main`. Documentation updated 2026-10-09.
 Upstream: [yingfan-bot/lotus](https://github.com/yingfan-bot/lotus), base commit
 `eb77e2f7909c5006f58ff0ad7cd6629b942caa9e`.
 
@@ -11,7 +11,7 @@ This is full fine-tuning of pretrained models, not training a language model fro
 scratch. It currently reuses the whole smaller transformer at each recurrence;
 it does not yet introduce a separate shallow recurrent core or layer pruning.
 
-Companion guides: [training batches](docs/TRAINING_BATCHES.md),
+Companion guides: [Colab notebook](docs/COLAB.md), [training batches](docs/TRAINING_BATCHES.md),
 [A100 planning](docs/A100_PLANNING.md), [evaluation](docs/EVALUATION.md),
 [audit status](docs/AUDIT_STATUS.md) and [upstream LOTUS](docs/UPSTREAM_LOTUS.md).
 

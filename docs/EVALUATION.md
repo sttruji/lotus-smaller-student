@@ -8,6 +8,12 @@ The evaluator runs greedy decoding on one example at a time. It supports the
 recurrent student and plain CoT baselines without loading a distillation teacher
 or training projections.
 
+For a persistent Colab run, cells 6 and 7 of the [notebook](COLAB.md) select a
+verified fully latent best checkpoint, export it, evaluate the pinned published
+CoT references and save comparison plots. That optional training path stores best
+generations under `best_checkpoints/epoch_N_GENERATION/`, rather than the legacy
+`checkpoint_final` file used in the raw command examples below.
+
 ## Exported student
 
 ~~~bash
