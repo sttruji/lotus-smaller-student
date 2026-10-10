@@ -55,9 +55,12 @@ First session: cells **1, 2, 3, 4, 5**; subsequent sessions: **1, 2, 3, 5**.
 Cells **6 and 7** evaluate completed training and plot comparisons against the
 published CoT 1B/3B reference checkpoints.
 
-The default is 2/64, effective batch 128. The notebook requires a high-RAM runtime
+The notebook default is 8/16, effective batch 128, selected for the A100 80 GB
+restart. Full stage-6 memory fit at this batch is unmeasured. Progress reports
+periodically with throughput and memory; the notebook requires a high-RAM runtime
 and a BF16 GPU with at least 35 GiB VRAM. Checkpoints recover completed epochs;
-an interrupted epoch repeats. Full Colab/Drive/GPU validation is still pending.
+an interrupted epoch repeats. Use the new `mb8` run ID to load the patched code.
+Full Colab/Drive/GPU validation is still pending.
 See [the Colab guide](docs/COLAB.md) for persistence, storage and session limits.
 
 ## Setup on a CUDA node

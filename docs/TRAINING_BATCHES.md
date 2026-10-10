@@ -17,6 +17,12 @@ the physical batch to investigate better GPU utilization. Neither has a measured
 A100 memory trace or throughput result. Profile the complete student/teacher
 workload at stage six, with representative long examples, before selecting 8/16.
 
+The [Colab notebook](COLAB.md#restarting-the-earlier-264-run-with-816) now defaults
+to **8/16** for the requested A100 80 GB restart after an approximately 18%-in-three-
+hours first-epoch report at 2/64. This is a selected configuration, not a measured
+8/16 throughput or capacity result. The notebook uses a new `mb8` run ID to avoid
+restoring the earlier run's pinned code and batch settings.
+
 The shared pilot defaults in [common.yaml](../args/research/common.yaml) are still
 2/16: batch 32 on one GPU and 128 on four. Request the recorded options explicitly:
 

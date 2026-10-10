@@ -70,8 +70,12 @@ def execute(command, log_path):
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     print("Running:", " ".join(str(item) for item in command), flush=True)
+    progress_interval = float(os.environ.get("LOTUS_PROGRESS_INTERVAL_SECONDS", "15"))
+    if not 0 < progress_interval < float("inf"):
+        raise ValueError("LOTUS_PROGRESS_INTERVAL_SECONDS must be finite and positive")
     env = dict(os.environ, PYTHONUNBUFFERED="1", WANDB_MODE="disabled",
-               TOKENIZERS_PARALLELISM="false", TQDM_MININTERVAL="10")
+               TOKENIZERS_PARALLELISM="false", TQDM_MININTERVAL=str(progress_interval),
+               LOTUS_PROGRESS_INTERVAL_SECONDS=str(progress_interval))
     with log_path.open("a", buffering=1024 * 1024) as log:
         process = subprocess.Popen([str(item) for item in command], cwd=REPO, env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -81,8 +85,8 @@ def execute(command, log_path):
             for line in process.stdout:
                 log.write(line)
                 now = time.monotonic()
-                if now - last_output >= 10 or any(word in line.lower() for word in
-                        ("checkpoint", "error", "traceback", "accuracy on validation", "restored", "epoch: ")):
+                if now - last_output >= progress_interval or any(word in line.lower() for word in
+                        ("checkpoint", "error", "traceback", "accuracy on validation", "restored")):
                     print(line.rstrip(), flush=True)
                     last_output = now
                 if now - last_flush >= 10:

@@ -52,6 +52,15 @@ access. New run plans are saved after successful preflight. This hardware report
 does not establish training memory usage or throughput. Recovery steps are in the
 [Colab guide](COLAB.md#recovering-from-a-cell-5-hugging-face-403).
 
+A later user report reached approximately 18% of epoch 1 after three hours at
+2/64. Source review found that per-microbatch tqdm description changes forced
+refreshes, while the Colab wrapper exempted every "Epoch:" line from throttling.
+Training now reports periodically, including throughput and training memory
+peaks, and reads loss scalars for console output only at that interval. Validation
+progress is also throttled and example traces require debug mode. The notebook
+now selects 8/16 with a new run ID for the requested restart; no 8/16 performance
+or full-stage memory result has been established.
+
 These changes have only received notebook-structure/Python-syntax/source review.
 No new runtime tests or GPU/Drive training run were performed. The 54-test record
 below predates the Colab changes and does not validate the new checkpoint protocol.

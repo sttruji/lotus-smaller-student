@@ -9,6 +9,7 @@ import json
 import os
 import random
 import sys
+import time
 from copy import copy
 from pathlib import Path
 
@@ -64,6 +65,9 @@ def main():
     config_dict = apply_overrides(load_hierarchical_yaml(args.config_file), args.set)
     validate_configuration(config_dict)
     accumulation_steps = int(config_dict.get("gradient_accumulation_steps", 1))
+    progress_interval = float(os.environ.get("LOTUS_PROGRESS_INTERVAL_SECONDS", "15"))
+    if not 0 < progress_interval < float("inf"):
+        raise ValueError("LOTUS_PROGRESS_INTERVAL_SECONDS must be finite and positive")
 
     # init distributed environment
     dist.init_process_group("nccl")
@@ -788,10 +792,16 @@ def main():
             total_length = len(train_dataloader)
             pbar = tqdm(
                 colour="blue",
-                desc=f"Training Epoch: {epoch+1}",
+                desc=f"Training Epoch: {epoch+1}/{configs.num_epochs} (Stage {scheduled_stage})",
                 total=total_length,
                 dynamic_ncols=True,
+                mininterval=progress_interval,
+                disable=rank != 0,
             )
+            last_progress = time.monotonic()
+            progress_examples = 0
+            if rank == 0:
+                torch.cuda.reset_peak_memory_stats(local_rank)
 
             for step, batch in enumerate(train_dataloader):
 
@@ -943,8 +953,6 @@ def main():
                         lr_scheduler.step()
                     optimizer.zero_grad()
                     total_train_steps += 1
-                pbar.update(1)
-
                 if wandb_run and rank == 0 and update_now:
                     _loss_display = loss.detach().float()
                     log_dict = {
@@ -971,17 +979,25 @@ def main():
                             log_dict[f"train/{_attr}"] = _v.detach().float() if isinstance(_v, torch.Tensor) else _v
                     wandb_run.log(log_dict)
 
-                _ia_str = ""
-                if hasattr(outputs, 'inter_answer_loss') and outputs.inter_answer_loss is not None:
-                    _ia_val = outputs.inter_answer_loss.detach().float() if isinstance(outputs.inter_answer_loss, torch.Tensor) else outputs.inter_answer_loss
-                    _ia_str = f" ia_loss: {round(float(_ia_val), 4)}"
-                _loss_val = round(float(loss.detach().float()), 4)
-                # if rank == 0 and step % 10 == 0:
-                #     print(f"[E{epoch+1} S{scheduled_stage} B{step}] loss={_loss_val}{_ia_str}", flush=True)
-                pbar.set_description(
-                    f"Training Epoch: {epoch+1}/{configs.num_epochs} (Stage {scheduled_stage}), batch {step}/{len(train_dataloader)} "
-                    f"completed (loss: {_loss_val}{_ia_str}"
-                )
+                # Reading a CUDA loss as a Python float synchronizes the GPU.
+                # Do that only at the reporting interval, and let tqdm enforce
+                # its interval instead of forcing a refresh every microbatch.
+                progress_examples += batch["input_ids"].shape[0] * world_size
+                now = time.monotonic()
+                if rank == 0 and (now - last_progress >= progress_interval or step + 1 == total_length):
+                    loss_value = round(float(loss.detach().float()), 4)
+                    now = time.monotonic()
+                    elapsed = max(now - last_progress, 1e-6)
+                    pbar.set_postfix({
+                        "loss": loss_value,
+                        "ex/s": round(progress_examples / elapsed, 2),
+                        "updates": total_train_steps,
+                        "peak_alloc_GiB": round(torch.cuda.max_memory_allocated(local_rank) / 1024**3, 1),
+                        "reserved_GiB": round(torch.cuda.memory_reserved(local_rank) / 1024**3, 1),
+                    }, refresh=False)
+                    last_progress = now
+                    progress_examples = 0
+                pbar.update(1)
             pbar.close()
             dist.barrier()
 
@@ -1153,8 +1169,10 @@ def main():
         total_length = len(valid_gen_dataloader)
 
         pbar = tqdm(
-            colour="blue", desc=f"Test Accuracy", total=total_length, dynamic_ncols=True
+            colour="blue", desc="Validation", total=total_length, dynamic_ncols=True,
+            mininterval=progress_interval, disable=rank != 0,
         )
+        last_valid_progress = time.monotonic()
         n_test_samples = len(answers_val)
         test_results = torch.zeros(n_test_samples, device=rank)
         test_cot_results = torch.zeros(n_test_samples, device=rank)
@@ -1199,7 +1217,7 @@ def main():
                     ("\n".join(text_output.split("\n")[1:])).split("#")[0].strip()
                 )
 
-                if idx < 5 and rank == 0:
+                if idx < 5 and rank == 0 and configs.debug:
                     # print some examples
                     print(
                         f"Question {test_idx}: Answer = '{answer}' CoT = '{answer_cot}'"
@@ -1219,10 +1237,13 @@ def main():
                 test_results[sample_idx] = float(answer_output == answer)
                 test_cot_results[sample_idx] = float(cot_output == answer_cot)
 
+                now = time.monotonic()
+                if rank == 0 and (now - last_valid_progress >= progress_interval or idx + 1 == total_length):
+                    pbar.set_postfix({"attempted_acc": round(
+                        float(test_results.sum().item()) / (idx + 1), 3
+                    )}, refresh=False)
+                    last_valid_progress = time.monotonic()
                 pbar.update(1)
-                pbar.set_description(
-                    f"Test accuracy: {round(float(test_results.sum().item() / n_test_samples), 2)}"
-                )
 
             pbar.close()
             print(f"Device {rank}: local_cor={int(test_results.sum().item())}, local_cot={int(test_cot_results.sum().item())}")

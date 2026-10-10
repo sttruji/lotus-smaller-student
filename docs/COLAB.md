@@ -42,10 +42,11 @@ cell 5 does not download it again. Re-run cell 4 only to prepare or repair data.
 - Keep only one active runtime per **RUN_ID**. The helper prevents duplicate
   launches inside one VM; it does not provide a lock across independent Colab VMs.
 
-The default is **2/64**, effective batch 128. **8/16** is selectable in cell 1
-after profiling the full stage-6 workload. There is no automatic precision,
-batch, teacher-size or dataset reduction. Optional train/validation limits in
-cell 1 are for a separate small pilot with a new run ID.
+The notebook default is now **8/16**, effective batch 128, for the requested A100
+80 GB restart. Full stage-6 and validation memory peaks at this batch have not
+been measured. **2/64** remains selectable with a new run ID. There is no automatic
+precision, batch, teacher-size or dataset reduction. Optional train/validation
+limits in cell 1 are for a separate small pilot with a new run ID.
 
 A bounded first pilot can use `RUN_ID="gsm-distill-pilot"`,
 `TRAIN_MAX_EXAMPLES=128`, `VAL_MAX_EXAMPLES=8` and `EPOCHS=7`. Seven epochs reach
@@ -72,7 +73,7 @@ MyDrive/lotus-research/                 # DRIVE_ROOT; editable in cell 1
     gsm_valid.json                     # 500 examples
     gsm_test.json                      # 1,319 examples
     dataset_manifest.json              # Source and prepared-data SHA-256
-  runs/gsm-distill-b128-mb2-seed0/       # RUN_ID; editable before first launch
+  runs/gsm-distill-b128-mb8-seed0/       # RUN_ID; editable before first launch
     run_plan.json                      # Recipe, code, versions, pinned Hub revisions
     requirements.freeze.txt
     run_manifest.json
@@ -144,6 +145,41 @@ Drive mounting does not guarantee remote synchronization: completion markers
 and checksums establish the mounted filesystem's contents, not a cloud durability
 acknowledgment. Google also documents runtime variability and Drive I/O limits.
 See the [Colab FAQ](https://research.google.com/colaboratory/faq.html).
+
+## Restarting the earlier 2/64 run with 8/16
+
+A user reported approximately 18% of the first epoch after three hours. If that
+time represents training rather than setup, it projects to roughly 16.7 hours
+for that epoch, before validation and checkpoint writes. Later stages add
+recurrent computation. This observation is approximate, not a steady-state
+benchmark or an end-to-end runtime estimate.
+
+Stop the old training cell before launching the updated notebook. Keep the same
+`DRIVE_ROOT` and use the updated `RUN_ID="gsm-distill-b128-mb8-seed0"` with
+`MICROBATCH, ACCUMULATION = 8, 16`. Run **1 → 2 → 3 → 5**; the prepared dataset
+and Hub cache are reused. The unfinished old epoch starts over. Its run folder
+is preserved, and its partial progress is not an epoch checkpoint. Reusing the
+old run ID would restore its pinned old code/packages and reject the new batch
+settings.
+
+Set `EPOCHS` before the first launch of the new run. The notebook labels its
+10-epoch setting as a pilot; 30 epochs matches LOTUS's reported training duration.
+Changing the duration after a run plan is created requires a new run ID.
+
+Cell 1's `PROGRESS_INTERVAL_SECONDS` defaults to 15 and can be changed between
+sessions without changing training identity. Training updates its loss,
+examples/second, optimizer-update count, peak allocated GPU GiB since the start
+of the current epoch, and current reserved GPU GiB at this interval. The wrapper
+also throttles notebook output; ordinary progress lines can be skipped when
+intervals overlap. Full subprocess output remains in the persistent log, and
+errors, checkpoint messages and final validation accuracy are forwarded promptly.
+
+The trainer no longer forces a tqdm refresh or converts loss scalars to Python
+on every microbatch. Validation progress uses the same interval, and example
+traces print only in debug mode. Reserved GPU memory includes the allocator
+cache; it is distinct from live tensor allocation. These logging fixes do not
+establish the speedup or stage-6 memory fit of 8/16. Mid-epoch checkpoint recovery
+is still unavailable.
 
 ## Recovering from a cell-2 ensurepip failure
 
